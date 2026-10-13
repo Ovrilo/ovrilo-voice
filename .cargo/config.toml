@@ -1,0 +1,4 @@
+# LiveKit's prebuilt libwebrtc for Windows is built with the static CRT (/MT).
+# Every binary that links it (this workspace and, later, the Tauri desktop host) must match.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
