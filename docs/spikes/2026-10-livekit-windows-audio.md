@@ -78,7 +78,10 @@ Pipeline: remote `NativeAudioStream` → DSP thread (`ProcessReverseStream`) →
 
 ## Pitfalls
 
-- **Claude Code's command sandbox blocks microphone capture** on this machine (`REGDB_E_CLASSNOTREG`, `0x800705AA`); tests needing a microphone must run in a normal terminal. Playout and networking work in the sandbox.
+- **Antivirus microphone protection:** the user's antivirus has an audio-recorder rule that inspects every new executable opening a capture device (logged for `voice_room.exe` on 2026-10-14 00:57, allowed). New builds/paths may be blocked, silenced or delayed until allowed. This may explain the sandbox capture errors and the −92/−109 dBFS results of the separately built experimental binary; the −62 dBFS ADM vs −9 dBFS cpal comparison was made with the same allowed `voice-spike.exe` minutes apart. Users will hit this too: the engine must report device errors, and the desktop app should explain antivirus/privacy prompts.
+- **Device open can block for seconds** (e.g. while antivirus decides). The engine currently opens devices on its control task; moving opens to a blocking thread with a timeout is a follow-up.
+
+- On 2026-10-13, microphone capture from Claude Code's command sandbox failed (`REGDB_E_CLASSNOTREG`, `0x800705AA`) while the user's own terminal worked; on 2026-10-14 sandboxed capture worked. Cause unconfirmed (possibly a transient Windows audio service state after the disk had been full). The WebRTC ADM near-silence result was reproduced in the user's terminal and is unaffected.
 - Windows built-in AEC hides capture failures as silence; the engine must not use it and must surface device errors explicitly.
 - WebRTC stationary noise suppression does not remove keyboard/mouse transients.
 - The tone beep detector reports false "beeps" on speech; latency figures are valid only for the tone source.

@@ -4,7 +4,9 @@ UI-independent Rust native voice engine for [Ovrilo](https://github.com/Ovrilo).
 
 ## Status
 
-- `crates/ovrilo-voice`: engine contract (`VoiceCommand`/`VoiceEvent`) and connection state machine.
+- `crates/ovrilo-voice`: portable engine core: contract (`VoiceCommand`/`VoiceEvent`), state machine, control task, DSP thread, mixer, and the `AudioBackend`/`Transport`/`AudioProcessor` boundaries. Tested with fakes (no devices or network).
+- `crates/ovrilo-voice-cpal`: cpal (WASAPI) audio backend; lock-free ring buffers, per-device threads, 48 kHz devices for now.
+- `crates/ovrilo-voice-livekit`: LiveKit transport and WebRTC audio processing; example `voice_room` joins a room with the real engine.
 - `crates/voice-spike`: Phase 02.1 development tool (not shipped) that validated LiveKit transport and app-owned microphone capture via cpal. Findings: [docs/spikes/2026-10-livekit-windows-audio.md](docs/spikes/2026-10-livekit-windows-audio.md); decision: ADR-0016 (Accepted).
 
 ## Windows build requirements
@@ -12,7 +14,7 @@ UI-independent Rust native voice engine for [Ovrilo](https://github.com/Ovrilo).
 - Visual Studio 2022 17.12+ (MSVC 14.42+) with Windows SDK 10.0.26100.
 - Static CRT (`.cargo/config.toml`); binaries linking this crate must also use `+crt-static`.
 - ~10 GB free disk: the build downloads LiveKit's prebuilt libwebrtc.
-- Microphone tests must run in a normal terminal (some sandboxed shells block capture).
+- If microphone capture fails from an automated/sandboxed shell, re-check with `voice-spike mic-level <index>` in a normal terminal.
 
 ## Commands
 
@@ -22,6 +24,8 @@ cargo test
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p voice-spike --release -- devices      # see the spike report for call/measure usage
+cargo run -p ovrilo-voice-livekit --example voice_room --release -- --list
+cargo run -p ovrilo-voice-livekit --example voice_room --release -- --identity alice --deafened
 ```
 
 ## Rules

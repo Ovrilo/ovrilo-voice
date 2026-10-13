@@ -1975,6 +1975,30 @@ dependencies = [
 [[package]]
 name = "ovrilo-voice"
 version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "ovrilo-voice-cpal"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "ovrilo-voice",
+ "rtrb",
+]
+
+[[package]]
+name = "ovrilo-voice-livekit"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "livekit",
+ "livekit-api",
+ "ovrilo-voice",
+ "ovrilo-voice-cpal",
+ "tokio",
+]
 
 [[package]]
 name = "parking_lot"
