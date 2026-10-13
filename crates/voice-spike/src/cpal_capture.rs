@@ -4,18 +4,14 @@
 //! from a USB microphone that cpal captures normally, so capture is done by us instead.
 //!
 //! Real-time rules (ADR-0009, AGENTS.md): the cpal callback only converts samples and pushes them into
-//! a lock-free SPSC ring buffer. No locks, no allocation, no I/O. A separate task pulls 10 ms frames,
-//! runs optional WebRTC audio processing and hands them to LiveKit.
+//! a lock-free SPSC ring buffer. No locks, no allocation, no I/O. The DSP thread (`dsp.rs`) pulls 10 ms frames,
+//! runs WebRTC audio processing and hands them to the LiveKit sender task.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
-use livekit::webrtc::audio_frame::AudioFrame;
-use livekit::webrtc::audio_source::native::NativeAudioSource;
-use livekit::webrtc::native::apm::AudioProcessingModule;
 
 /// A running capture stream; dropping it stops capture. Kept on the owning thread (cpal streams are not Send).
 pub struct CpalCapture {
@@ -26,10 +22,10 @@ pub struct CpalCapture {
     pub overflow_samples: Arc<AtomicU64>,
 }
 
-/// Consumer side of the capture ring buffer; moved into the feeder task.
+/// Consumer side of the capture ring buffer; owned by the DSP thread.
 pub struct CaptureFeed {
     consumer: rtrb::Consumer<i16>,
-    sample_rate: u32,
+    pub sample_rate: u32,
 }
 
 /// Opens the input device (cpal index from `voice-spike mic-level`, or the system default) and starts
@@ -113,40 +109,16 @@ fn push_mono<T: Copy>(
 }
 
 impl CaptureFeed {
-    /// Pulls 10 ms frames from the ring buffer and publishes them. Runs until the source rejects a frame.
-    pub async fn feed(mut self, source: NativeAudioSource, mut apm: Option<AudioProcessingModule>) {
-        let samples_per_frame = (self.sample_rate / 100) as usize;
-        let mut buffer = vec![0i16; samples_per_frame];
-        loop {
-            if self.consumer.slots() < samples_per_frame {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-                continue;
-            }
-            let chunk = self
-                .consumer
-                .read_chunk(samples_per_frame)
-                .expect("checked slots");
-            let (first, second) = chunk.as_slices();
-            buffer[..first.len()].copy_from_slice(first);
-            buffer[first.len()..].copy_from_slice(second);
-            chunk.commit_all();
-
-            if let Some(apm) = apm.as_mut()
-                && let Err(error) = apm.process_stream(&mut buffer, self.sample_rate as i32, 1)
-            {
-                eprintln!("audio processing failed: {error}");
-            }
-
-            let frame = AudioFrame {
-                data: buffer.as_slice().into(),
-                sample_rate: self.sample_rate,
-                num_channels: 1,
-                samples_per_channel: samples_per_frame as u32,
-            };
-            if let Err(error) = source.capture_frame(&frame).await {
-                eprintln!("capture_frame failed: {error}");
-                return;
-            }
+    /// Copies one full frame (`out.len()` samples) out of the ring buffer; false if not enough is buffered.
+    pub fn read_frame(&mut self, out: &mut [i16]) -> bool {
+        if out.is_empty() || self.consumer.slots() < out.len() {
+            return false;
         }
+        let chunk = self.consumer.read_chunk(out.len()).expect("checked slots");
+        let (first, second) = chunk.as_slices();
+        out[..first.len()].copy_from_slice(first);
+        out[first.len()..].copy_from_slice(second);
+        chunk.commit_all();
+        true
     }
 }

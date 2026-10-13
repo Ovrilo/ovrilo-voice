@@ -61,6 +61,21 @@ CPU is a share of the whole machine (12 threads). Working set is dominated by sh
 | Continuity | 50.2 s of audio over 50.2 s, max inter-frame gap 13 ms, 0 ring-buffer overflow samples |
 | User assessment | Own voice clearly audible; latency not disturbing; no robotic artifacts or dropouts; keyboard/mouse clicks still audible |
 
+### cpal playout + APM echo cancellation (user terminal, headphones placed next to the mic)
+
+Pipeline: remote `NativeAudioStream` → DSP thread (`ProcessReverseStream`) → playout ring (40 ms pre-buffer, trim above 100 ms) → cpal output; cpal input → ring → DSP thread (`ProcessStream`) → `NativeAudioSource`. A tone publisher's beep plays through bob's speaker into bob's mic; a third client measures bob's published audio. Metric: median of per-second peak 440 Hz amplitude.
+
+| Bob processing | Echo (440 Hz) leaked | Beeps detected in bob's stream | Peak level |
+|---|---|---|---|
+| off | −29.8 dBFS | 19/24 | −12.7 dBFS |
+| AEC only | −38.6 dBFS | 2/24 | −30.1 dBFS |
+| AEC + AGC + NS + HPF | −31.3 dBFS | 10/24 | −14.8 dBFS |
+
+- Playout: mean ring fill 30–38 ms, 0–1 underruns per 25 s, no trims, no overflow; DSP: 0 APM errors, 0 dropped frames.
+- Echo path delay (`voice-spike echo-delay 4 5`): 116 ms from cpal playback timestamp to capture timestamp (USB codec internal latency); total reverse-to-capture ≈ 170–180 ms including the playout ring.
+- Assessment: AEC is active but weak on this setup (~9 dB on a pure tone). AGC re-amplifies residual echo. Tonal test signals and headphones next to the mic are poor AEC stimuli; tuning and acceptance move to the two-PC test (02.2) and audio quality profiles (Phase 07).
+- Found and fixed: the SFU reuses a receiver for the next participant; remote-audio sinks must be detached on `TrackUnsubscribed`, otherwise they keep reading the next participant's audio.
+
 ## Pitfalls
 
 - **Claude Code's command sandbox blocks microphone capture** on this machine (`REGDB_E_CLASSNOTREG`, `0x800705AA`); tests needing a microphone must run in a normal terminal. Playout and networking work in the sandbox.
@@ -71,7 +86,7 @@ CPU is a share of the whole machine (12 threads). Working set is dominated by sh
 ## Not yet validated
 
 - Two physical PCs over a real network (LAN/WAN, TURN).
-- Playout through cpal, AEC with the reverse stream, speakers instead of headphones.
+- AEC quality in a real speaker scenario (needs two PCs); AGC/AEC interaction; multi-participant mixing (spike plays only the first remote).
 - Device hot-plug, sample-rate conversion for non-48 kHz devices, long sessions, 4–8 participants.
 - Reconnection and token expiry; API-issued room tokens (milestone 02.3).
 
@@ -87,4 +102,7 @@ pwsh scripts/measure-processes.ps1 -Name voice-spike -Seconds 60
 # microphone (own terminal, headphones):
 target/release/voice-spike call --identity bob --play --output <headphones index> --measure --seconds 60
 target/release/voice-spike call --identity alice --source cpal-mic --input <cpal input index> --processing sw --seconds 50
+# echo test: tone publisher + measuring client + bob with cpal mic and cpal speaker
+target/release/voice-spike call --identity bob --source cpal-mic --input 4 --playback cpal --output 5 --processing aec --seconds 25
+target/release/voice-spike echo-delay <cpal input index> <cpal output index>
 ```

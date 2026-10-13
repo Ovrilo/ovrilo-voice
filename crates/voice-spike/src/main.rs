@@ -14,7 +14,10 @@
 //! ```
 
 mod cpal_capture;
+mod cpal_playback;
 mod cpal_probe;
+mod dsp;
+mod echo_delay;
 mod signal;
 
 use std::collections::HashMap;
@@ -59,6 +62,15 @@ struct CallArgs {
     input: Option<usize>,
     output: Option<usize>,
     processing: Processing,
+    playback: Playback,
+}
+
+/// Where remote audio is played: WebRTC's platform ADM (`--play`) or our own cpal output (`--playback cpal`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Playback {
+    None,
+    Platform,
+    Cpal,
 }
 
 /// Audio processing mode for platform audio: hardware-preferred (default), software APM, or none.
@@ -66,6 +78,8 @@ struct CallArgs {
 enum Processing {
     Hardware,
     Software,
+    /// Echo cancellation only (cpal paths), for measuring AEC in isolation.
+    EchoOnly,
     Off,
 }
 
@@ -75,6 +89,11 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("devices") => list_devices(),
+        Some("cpal-devices") => cpal_playback::list_devices(),
+        Some("echo-delay") => echo_delay::measure(
+            args.get(1).and_then(|v| v.parse().ok()),
+            args.get(2).and_then(|v| v.parse().ok()),
+        ),
         Some("mic-level") => cpal_probe::mic_level(args.get(1).and_then(|v| v.parse().ok()), 8),
         Some("call") => match parse_call(&args[1..]) {
             Ok(call_args) => call(call_args).await,
@@ -94,10 +113,12 @@ async fn main() -> ExitCode {
 const USAGE: &str = "usage:
   voice-spike devices
   voice-spike mic-level [cpal input index]
+  voice-spike cpal-devices
+  voice-spike echo-delay [cpal input index] [cpal output index]
   voice-spike call --identity <name> [--room ovrilo-spike] [--url ws://127.0.0.1:7880]
                    [--source none|tone|mic|cpal-mic] [--play] [--measure] [--seconds N]
                    [--input <recording device index>] [--output <playout device index>]
-                   [--processing hw|sw|off]";
+                   [--processing hw|sw|aec|off] [--playback platform|cpal]";
 
 fn parse_call(args: &[String]) -> Result<CallArgs, String> {
     let mut call = CallArgs {
@@ -111,6 +132,7 @@ fn parse_call(args: &[String]) -> Result<CallArgs, String> {
         input: None,
         output: None,
         processing: Processing::Hardware,
+        playback: Playback::None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -133,6 +155,13 @@ fn parse_call(args: &[String]) -> Result<CallArgs, String> {
                 }
             }
             "--play" => call.play = true,
+            "--playback" => {
+                call.playback = match value()?.as_str() {
+                    "platform" => Playback::Platform,
+                    "cpal" => Playback::Cpal,
+                    other => return Err(format!("unknown playback '{other}'")),
+                }
+            }
             "--measure" => call.measure = true,
             "--seconds" => {
                 call.seconds = Some(value()?.parse().map_err(|_| "--seconds must be a number")?)
@@ -142,6 +171,7 @@ fn parse_call(args: &[String]) -> Result<CallArgs, String> {
                     "hw" => Processing::Hardware,
                     "sw" => Processing::Software,
                     "off" => Processing::Off,
+                    "aec" => Processing::EchoOnly,
                     other => return Err(format!("unknown processing mode '{other}'")),
                 }
             }
@@ -161,6 +191,9 @@ fn parse_call(args: &[String]) -> Result<CallArgs, String> {
             }
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
+    }
+    if call.play && call.playback == Playback::None {
+        call.playback = Playback::Platform;
     }
     if call.identity.is_empty() {
         return Err(format!("--identity is required\n{USAGE}"));
@@ -265,7 +298,7 @@ fn dev_token(identity: &str, room: &str) -> Result<String, String> {
 async fn call(args: CallArgs) -> Result<(), String> {
     // Platform audio (WASAPI via WebRTC ADM) is only needed for the microphone or speaker playout.
     // Without it, remote audio is consumed in "synthetic" mode, which keeps measurements device-independent.
-    let platform = if args.source == Source::Mic || args.play {
+    let platform = if args.source == Source::Mic || args.playback == Playback::Platform {
         Some(PlatformAudio::new().map_err(|e| format!("platform audio unavailable: {e}"))?)
     } else {
         None
@@ -287,6 +320,48 @@ async fn call(args: CallArgs) -> Result<(), String> {
         None
     };
     let mut capture_guard = None;
+    let (playback_guard, playback_feed) = if args.playback == Playback::Cpal {
+        let (playback, feed) = cpal_playback::start(args.output)?;
+        println!(
+            "cpal speaker: {} ({} Hz)",
+            playback.device_name, playback.sample_rate
+        );
+        (Some(playback), Some(feed))
+    } else {
+        (None, None)
+    };
+    let playout_rate = playback_feed.as_ref().map(|f| f.sample_rate);
+    let (remote_tx, remote_rx) = std::sync::mpsc::channel::<Vec<i16>>();
+    let (processed_tx, mut processed_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(50);
+    let has_cpal_capture = cpal_capture.is_some();
+    let enabled = args.processing != Processing::Off;
+    let dsp_processing = dsp::Processing {
+        // AEC needs both our capture and our playout in this process.
+        echo_cancellation: enabled && has_cpal_capture && playback_feed.is_some(),
+        gain_control: enabled && has_cpal_capture && args.processing != Processing::EchoOnly,
+        high_pass: enabled && has_cpal_capture && args.processing != Processing::EchoOnly,
+        noise_suppression: enabled && has_cpal_capture && args.processing != Processing::EchoOnly,
+    };
+    let (cpal_capture, capture_feed) = match cpal_capture {
+        Some((capture, feed)) => (Some(capture), Some(feed)),
+        None => (None, None),
+    };
+    let dsp = (capture_feed.is_some() || playback_feed.is_some()).then(|| {
+        dsp::Dsp::spawn(
+            dsp_processing,
+            capture_feed,
+            playback_feed,
+            remote_rx,
+            processed_tx,
+        )
+    });
+    if dsp.is_some() {
+        println!("dsp: {dsp_processing:?}");
+    }
+    let mut playing_from: Option<String> = None;
+    // Per-participant tasks reading remote audio; aborted on unsubscribe because the SFU may reuse the
+    // receiver for the next participant and a stale sink would keep reading their audio.
+    let mut remote_tasks: HashMap<String, Vec<tokio::task::JoinHandle<()>>> = HashMap::new();
 
     let token = dev_token(&args.identity, &args.room)?;
     let connect_started = Instant::now();
@@ -318,7 +393,7 @@ async fn call(args: CallArgs) -> Result<(), String> {
             tone_task = Some(tokio::spawn(run_tone(source)));
         }
         Source::CpalMic => {
-            let (capture, feed) = cpal_capture.expect("cpal capture opened above");
+            let capture = cpal_capture.expect("cpal capture opened above");
             let source = NativeAudioSource::new(
                 AudioSourceOptions {
                     echo_cancellation: false,
@@ -330,11 +405,21 @@ async fn call(args: CallArgs) -> Result<(), String> {
                 100,
             );
             publish(&room, "microphone", RtcAudioSource::Native(source.clone())).await?;
-            // Software processing only; AEC needs the playout reference, which arrives with our own playout.
-            let apm = (args.processing != Processing::Off).then(|| {
-                livekit::webrtc::native::apm::AudioProcessingModule::new(false, true, true, true)
-            });
-            tone_task = Some(tokio::spawn(feed.feed(source, apm)));
+            let sample_rate = capture.sample_rate;
+            tone_task = Some(tokio::spawn(async move {
+                while let Some(samples) = processed_rx.recv().await {
+                    let frame = AudioFrame {
+                        samples_per_channel: samples.len() as u32,
+                        data: samples.into(),
+                        sample_rate,
+                        num_channels: 1,
+                    };
+                    if let Err(error) = source.capture_frame(&frame).await {
+                        eprintln!("capture_frame failed: {error}");
+                        return;
+                    }
+                }
+            }));
             capture_guard = Some(capture);
         }
         Source::Mic => {
@@ -371,8 +456,35 @@ async fn call(args: CallArgs) -> Result<(), String> {
             } => {
                 let who = participant.identity().to_string();
                 println!("[{}] subscribed to audio from {who}", args.identity);
+                if let Some(rate) = playout_rate
+                    && playing_from.is_none()
+                {
+                    // Spike limitation: plays the first remote participant only (no mixer yet).
+                    println!("[{}] playing {who} through cpal", args.identity);
+                    playing_from = Some(who.clone());
+                    let mut stream = NativeAudioStream::new(track.rtc_track(), rate as i32, 1);
+                    let remote_tx = remote_tx.clone();
+                    let task = tokio::spawn(async move {
+                        while let Some(frame) = stream.next().await {
+                            if remote_tx.send(frame.data.to_vec()).is_err() {
+                                return;
+                            }
+                        }
+                    });
+                    remote_tasks.entry(who.clone()).or_default().push(task);
+                }
                 if args.measure {
-                    tokio::spawn(measure(track, who, reports.clone()));
+                    let task = tokio::spawn(measure(track, who.clone(), reports.clone()));
+                    remote_tasks.entry(who).or_default().push(task);
+                }
+            }
+            RoomEvent::TrackUnsubscribed { participant, .. } => {
+                let who = participant.identity().to_string();
+                for task in remote_tasks.remove(&who).unwrap_or_default() {
+                    task.abort();
+                }
+                if playing_from.as_deref() == Some(who.as_str()) {
+                    playing_from = None;
                 }
             }
             RoomEvent::ParticipantConnected(p) => {
@@ -396,6 +508,20 @@ async fn call(args: CallArgs) -> Result<(), String> {
 
     if let Some(task) = tone_task {
         task.abort();
+    }
+    if let Some(dsp) = dsp {
+        println!("dsp stats: {:?}", dsp.stop());
+    }
+    if let Some(playback) = playback_guard {
+        println!(
+            "playout underruns: {}, latency trims: {}",
+            playback
+                .underruns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            playback
+                .latency_trims
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
     if let Some(capture) = capture_guard {
         println!(
@@ -493,6 +619,11 @@ struct TrackReport {
     peak_dbfs: f32,
     last_frame_at: Option<Instant>,
     detector: BeepDetector,
+    /// Wall-clock second currently being tracked for the 440 Hz level.
+    tone_second: u64,
+    tone_second_max: f32,
+    /// Highest 440 Hz amplitude seen in each completed second (echo-leak metric).
+    tone_maxima: Vec<f32>,
 }
 
 /// Consumes a remote audio track off the real-time thread and records arrival statistics.
@@ -519,6 +650,17 @@ async fn measure(
             report.max_gap_ms = report.max_gap_ms.max(now.duration_since(last).as_millis());
         }
         report.last_frame_at = Some(now);
+        let second = arrival / 1000;
+        if second != report.tone_second {
+            if report.tone_second != 0 {
+                let max = report.tone_second_max;
+                report.tone_maxima.push(max);
+            }
+            report.tone_second = second;
+            report.tone_second_max = 0.0;
+        }
+        let tone = signal::tone_amplitude(&frame.data, frame.sample_rate, signal::TONE_HZ);
+        report.tone_second_max = report.tone_second_max.max(tone);
         if let Some(latency) = report
             .detector
             .push(&frame.data, frame.sample_rate, arrival)
@@ -557,6 +699,15 @@ fn print_reports(identity: &str, reports: &HashMap<String, TrackReport>, elapsed
                 );
             }
             None => println!("beeps: none detected"),
+        }
+        let mut maxima = report.tone_maxima.clone();
+        maxima.sort_by(f32::total_cmp);
+        if let Some(median) = maxima.get(maxima.len() / 2) {
+            println!(
+                "440 Hz level (median of per-second peaks): {:.1} dBFS over {} s",
+                20.0 * median.max(1e-6).log10(),
+                maxima.len()
+            );
         }
     }
 }
