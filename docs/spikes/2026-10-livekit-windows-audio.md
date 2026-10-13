@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-13/14
 **Tool:** `crates/voice-spike` (development only, not shipped)
-**Outcome:** LiveKit transport validated; WebRTC's Windows capture rejected; app-owned capture via cpal validated. Decision: ADR-0016 (Proposed).
+**Outcome:** LiveKit transport validated; WebRTC's Windows capture rejected; app-owned capture via cpal validated. Decision: ADR-0016 (Accepted).
 
 ## Environment
 

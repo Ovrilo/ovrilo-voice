@@ -5,7 +5,7 @@ UI-independent Rust native voice engine for [Ovrilo](https://github.com/Ovrilo).
 ## Status
 
 - `crates/ovrilo-voice`: engine contract (`VoiceCommand`/`VoiceEvent`) and connection state machine.
-- `crates/voice-spike`: Phase 02.1 development tool (not shipped) that validated LiveKit transport and app-owned microphone capture via cpal. Findings: [docs/spikes/2026-10-livekit-windows-audio.md](docs/spikes/2026-10-livekit-windows-audio.md); decision: ADR-0016 (Proposed).
+- `crates/voice-spike`: Phase 02.1 development tool (not shipped) that validated LiveKit transport and app-owned microphone capture via cpal. Findings: [docs/spikes/2026-10-livekit-windows-audio.md](docs/spikes/2026-10-livekit-windows-audio.md); decision: ADR-0016 (Accepted).
 
 ## Windows build requirements
 
