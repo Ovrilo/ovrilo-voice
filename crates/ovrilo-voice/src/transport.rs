@@ -51,6 +51,11 @@ pub enum TransportEvent {
     ParticipantLeft {
         id: ParticipantId,
     },
+    /// A remote participant muted or unmuted their microphone (also sent right after joining).
+    ParticipantMuted {
+        id: ParticipantId,
+        muted: bool,
+    },
     /// A remote participant's audio became available. Frames stop when the track ends.
     RemoteAudioStarted {
         id: ParticipantId,

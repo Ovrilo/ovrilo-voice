@@ -161,6 +161,20 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
                     self.update_transmitting();
                 }
             }
+            VoiceCommand::SetParticipantVolume {
+                participant,
+                percent,
+            } => {
+                let percent = percent.min(200);
+                self.dsp.send(DspCommand::SetParticipantVolume(
+                    participant.clone(),
+                    percent,
+                ));
+                self.emit(VoiceEvent::ParticipantVolumeChanged {
+                    participant,
+                    percent,
+                });
+            }
             VoiceCommand::SetPushToTalkPressed(pressed) => {
                 if self.push_to_talk && pressed != self.ptt_pressed {
                     self.ptt_pressed = pressed;
@@ -292,6 +306,12 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
         match event {
             TransportEvent::ParticipantJoined { id, name } => {
                 self.emit(VoiceEvent::ParticipantJoined { id, name })
+            }
+            TransportEvent::ParticipantMuted { id, muted } => {
+                self.emit(VoiceEvent::ParticipantMutedChanged {
+                    participant: id,
+                    muted,
+                })
             }
             TransportEvent::ParticipantLeft { id } => {
                 self.dsp.send(DspCommand::RemoveRemote(id.clone()));

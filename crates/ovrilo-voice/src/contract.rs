@@ -54,6 +54,12 @@ pub enum VoiceCommand {
     SetPushToTalk(bool),
     /// State of the push-to-talk key, from the host's key watcher. Ignored when push-to-talk is off.
     SetPushToTalkPressed(bool),
+    /// Local playback volume for one participant, 0–200 % (100 = unchanged; values above 200
+    /// are clamped). Kept for the engine's lifetime, so it also applies when they join later.
+    SetParticipantVolume {
+        participant: ParticipantId,
+        percent: u16,
+    },
 }
 
 /// Notifications emitted by the engine. The engine is authoritative for this state (ADR-0011).
@@ -72,6 +78,11 @@ pub enum VoiceEvent {
     ParticipantLeft {
         id: ParticipantId,
     },
+    /// A remote participant's own microphone mute (as published to the room).
+    ParticipantMutedChanged {
+        participant: ParticipantId,
+        muted: bool,
+    },
     DevicesChanged {
         inputs: Vec<AudioDevice>,
         outputs: Vec<AudioDevice>,
@@ -83,6 +94,10 @@ pub enum VoiceEvent {
     /// Voice quality diagnostics, about once per second while in a room.
     StatsUpdated(VoiceStats),
     PushToTalkChanged(bool),
+    ParticipantVolumeChanged {
+        participant: ParticipantId,
+        percent: u16,
+    },
     /// Whether microphone audio is currently allowed out (not muted, not deafened, and the
     /// push-to-talk key held when push-to-talk is on). Reported on changes.
     TransmittingChanged(bool),

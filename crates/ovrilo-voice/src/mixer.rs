@@ -20,8 +20,21 @@ impl Default for Mixer {
 
 impl Mixer {
     pub fn add(&mut self, frame: &Frame) {
-        for (acc, &sample) in self.accumulator.iter_mut().zip(frame) {
-            *acc += i32::from(sample);
+        self.add_scaled(frame, 100);
+    }
+
+    /// Adds a frame at `percent` volume (100 = unchanged). Integer math; clipping happens once
+    /// in [`Mixer::finish`].
+    pub fn add_scaled(&mut self, frame: &Frame, percent: u16) {
+        if percent == 100 {
+            for (acc, &sample) in self.accumulator.iter_mut().zip(frame) {
+                *acc += i32::from(sample);
+            }
+        } else {
+            let percent = i32::from(percent);
+            for (acc, &sample) in self.accumulator.iter_mut().zip(frame) {
+                *acc += i32::from(sample) * percent / 100;
+            }
         }
         self.sources += 1;
     }
@@ -57,6 +70,17 @@ mod tests {
 
         mixer.finish(&mut out);
         assert!(out.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn scales_per_source() {
+        let mut mixer = Mixer::default();
+        mixer.add_scaled(&[1000; FRAME_SAMPLES], 50);
+        mixer.add_scaled(&[1000; FRAME_SAMPLES], 200);
+        mixer.add_scaled(&[1000; FRAME_SAMPLES], 0);
+        let mut out = [0; FRAME_SAMPLES];
+        mixer.finish(&mut out);
+        assert!(out.iter().all(|&s| s == 2500));
     }
 
     #[test]

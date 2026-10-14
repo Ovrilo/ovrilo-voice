@@ -648,3 +648,73 @@ async fn push_to_talk_key_is_ignored_when_push_to_talk_is_off() {
     ])
     .await;
 }
+
+#[tokio::test]
+async fn participant_volume_scales_playout_and_survives_rejoin() {
+    let mut h = start(Devices::default(), FakeTransport::default());
+    h.join().await;
+    let a = ParticipantId("a".into());
+
+    // Set before their audio starts (e.g. restored from settings).
+    h.send(VoiceCommand::SetParticipantVolume {
+        participant: a.clone(),
+        percent: 50,
+    });
+    h.expect(&[VoiceEvent::ParticipantVolumeChanged {
+        participant: a.clone(),
+        percent: 50,
+    }])
+    .await;
+    let (tx, rx) = mpsc::channel(20);
+    h.room_event(TransportEvent::RemoteAudioStarted {
+        id: a.clone(),
+        frames: rx,
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tx.send([200; FRAME_SAMPLES]).await.unwrap();
+    h.wait_until("half-volume audio is played", |h| {
+        h.devices
+            .played
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.iter().all(|&s| s == 100))
+    })
+    .await;
+
+    // Over-range requests are clamped.
+    h.send(VoiceCommand::SetParticipantVolume {
+        participant: a.clone(),
+        percent: 900,
+    });
+    h.expect(&[VoiceEvent::ParticipantVolumeChanged {
+        participant: a,
+        percent: 200,
+    }])
+    .await;
+    tx.send([200; FRAME_SAMPLES]).await.unwrap();
+    h.wait_until("double-volume audio is played", |h| {
+        h.devices
+            .played
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.iter().all(|&s| s == 400))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn remote_microphone_mute_is_forwarded() {
+    let mut h = start(Devices::default(), FakeTransport::default());
+    h.join().await;
+    h.room_event(TransportEvent::ParticipantMuted {
+        id: ParticipantId("a".into()),
+        muted: true,
+    });
+    h.expect(&[VoiceEvent::ParticipantMutedChanged {
+        participant: ParticipantId("a".into()),
+        muted: true,
+    }])
+    .await;
+}

@@ -82,6 +82,7 @@ impl Transport for LiveKitTransport {
         // Participants already in the room.
         for participant in room.remote_participants().values() {
             let _ = event_tx.send(joined(participant));
+            let _ = event_tx.send(microphone_muted(participant));
         }
 
         let tasks = vec![
@@ -183,6 +184,34 @@ fn network_stats(publisher: &[RtcStats], subscriber: &[RtcStats]) -> NetworkStat
     stats
 }
 
+/// A participant without a published microphone counts as not muted (still connecting).
+fn microphone_muted(participant: &RemoteParticipant) -> TransportEvent {
+    let muted = participant
+        .track_publications()
+        .values()
+        .any(|p| p.source() == TrackSource::Microphone && p.is_muted());
+    TransportEvent::ParticipantMuted {
+        id: ParticipantId(participant.identity().to_string()),
+        muted,
+    }
+}
+
+fn mute_event(
+    participant: &Participant,
+    publication: &TrackPublication,
+    muted: bool,
+) -> Option<TransportEvent> {
+    match participant {
+        Participant::Remote(remote) if publication.source() == TrackSource::Microphone => {
+            Some(TransportEvent::ParticipantMuted {
+                id: ParticipantId(remote.identity().to_string()),
+                muted,
+            })
+        }
+        _ => None,
+    }
+}
+
 fn joined(participant: &RemoteParticipant) -> TransportEvent {
     let id = participant.identity().to_string();
     let name = participant.name();
@@ -255,6 +284,14 @@ async fn forward_room_events(
                     id: ParticipantId(id),
                 })
             }
+            RoomEvent::TrackMuted {
+                participant,
+                publication,
+            } => mute_event(&participant, &publication, true),
+            RoomEvent::TrackUnmuted {
+                participant,
+                publication,
+            } => mute_event(&participant, &publication, false),
             RoomEvent::Reconnecting => Some(TransportEvent::Reconnecting),
             RoomEvent::Reconnected => Some(TransportEvent::Reconnected),
             RoomEvent::Disconnected { reason } => Some(TransportEvent::Disconnected {

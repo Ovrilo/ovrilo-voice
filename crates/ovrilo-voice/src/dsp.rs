@@ -6,6 +6,7 @@
 //! This is not a real-time callback (those live in the backend); it may block briefly and sleeps
 //! when idle. Mixing is paced by the playout buffer so latency does not grow with participants.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -43,6 +44,7 @@ pub(crate) enum DspCommand {
     SetDeafened(bool),
     SetPushToTalk(bool),
     SetPushToTalkPressed(bool),
+    SetParticipantVolume(ParticipantId, u16),
     /// Replies once every earlier command has been applied (commands are processed in order).
     Barrier(tokio::sync::oneshot::Sender<()>),
 }
@@ -143,6 +145,8 @@ struct DspLoop {
     playout: Option<Box<dyn PlayoutStream>>,
     microphone: Option<mpsc::Sender<Frame>>,
     remotes: Vec<Remote>,
+    /// Per-participant playback volume (percent), applied when their audio starts.
+    volumes: HashMap<ParticipantId, u16>,
     mixer: Mixer,
     muted: bool,
     deafened: bool,
@@ -160,6 +164,7 @@ struct Remote {
     id: ParticipantId,
     frames: mpsc::Receiver<Frame>,
     speaking: SpeakingDetector,
+    volume: u16,
 }
 
 impl DspLoop {
@@ -177,6 +182,7 @@ impl DspLoop {
             playout: None,
             microphone: None,
             remotes: Vec::new(),
+            volumes: HashMap::new(),
             mixer: Mixer::default(),
             muted: false,
             deafened: false,
@@ -212,10 +218,12 @@ impl DspLoop {
             DspCommand::SetMicrophoneSink(sink) => self.microphone = sink,
             DspCommand::AddRemote(id, frames) => {
                 self.remove_remote(&id);
+                let volume = self.volumes.get(&id).copied().unwrap_or(100);
                 self.remotes.push(Remote {
                     id,
                     frames,
                     speaking: SpeakingDetector::default(),
+                    volume,
                 });
             }
             DspCommand::RemoveRemote(id) => self.remove_remote(&id),
@@ -239,6 +247,16 @@ impl DspLoop {
                 self.deafened = deafened;
                 if deafened {
                     self.silence_local();
+                }
+            }
+            DspCommand::SetParticipantVolume(id, percent) => {
+                if let Some(remote) = self.remotes.iter_mut().find(|r| r.id == id) {
+                    remote.volume = percent;
+                }
+                if percent == 100 {
+                    self.volumes.remove(&id);
+                } else {
+                    self.volumes.insert(id, percent);
                 }
             }
             DspCommand::SetPushToTalk(enabled) => {
@@ -332,7 +350,8 @@ impl DspLoop {
                         speaking,
                     });
                 }
-                self.mixer.add(&audio);
+                // Speaking detection above used the received level; volume only changes playback.
+                self.mixer.add_scaled(&audio, remote.volume);
             }
         }
         self.mixer.finish(frame);
