@@ -172,11 +172,10 @@ mod platform {
                 let samples: Vec<i16> = bytes
                     .drain(..bytes_per_frame)
                     .collect::<Vec<u8>>()
-                    .chunks_exact(4)
-                    .map(|b| {
-                        (f32::from_le_bytes([b[0], b[1], b[2], b[3]]).clamp(-1.0, 1.0) * 32767.0)
-                            as i16
-                    })
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| (f32::from_le_bytes(*b).clamp(-1.0, 1.0) * 32767.0) as i16)
                     .collect();
                 if tx.try_send(samples).is_err() {
                     dropped.fetch_add(1, Ordering::Relaxed);
