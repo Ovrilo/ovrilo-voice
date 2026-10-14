@@ -557,6 +557,7 @@ async fn speaking_is_reported_for_self_and_remotes_and_cleared_when_muted() {
             speaking: false,
         },
         VoiceEvent::MicrophoneMutedChanged(true),
+        VoiceEvent::TransmittingChanged(false),
     ])
     .await;
 
@@ -580,5 +581,70 @@ async fn speaking_is_reported_for_self_and_remotes_and_cleared_when_muted() {
         participant: Some(ParticipantId("a".into())),
         speaking: false,
     }])
+    .await;
+}
+
+#[tokio::test]
+async fn push_to_talk_transmits_only_while_the_key_is_held() {
+    let mut h = start(Devices::default(), FakeTransport::default());
+    h.join().await;
+    let mut microphone = h.take_microphone();
+
+    h.send(VoiceCommand::SetPushToTalk(true));
+    h.expect(&[
+        VoiceEvent::PushToTalkChanged(true),
+        VoiceEvent::TransmittingChanged(false),
+    ])
+    .await;
+
+    // Key up: the stream continues, but only with silence, and nobody is "speaking".
+    h.speak(3000, 5);
+    for _ in 0..5 {
+        let frame = tokio::time::timeout(Duration::from_secs(2), microphone.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(frame.iter().all(|&s| s == 0), "silence while the key is up");
+    }
+
+    h.send(VoiceCommand::SetPushToTalkPressed(true));
+    h.expect(&[VoiceEvent::TransmittingChanged(true)]).await;
+    h.speak(3000, 5);
+    h.expect(&[VoiceEvent::SpeakingChanged {
+        participant: None,
+        speaking: true,
+    }])
+    .await;
+    let mut voiced = 0;
+    while let Ok(Some(frame)) =
+        tokio::time::timeout(Duration::from_millis(200), microphone.recv()).await
+    {
+        if frame.iter().all(|&s| s == 3000) {
+            voiced += 1;
+        }
+    }
+    assert_eq!(voiced, 5, "held key transmits the microphone");
+
+    h.send(VoiceCommand::SetPushToTalkPressed(false));
+    h.expect(&[VoiceEvent::TransmittingChanged(false)]).await;
+    // The release tail keeps the end of the word...
+    h.speak(3000, 3);
+    for _ in 0..3 {
+        let frame = microphone.recv().await.unwrap();
+        assert!(frame.iter().all(|&s| s == 3000), "release tail transmits");
+    }
+}
+
+#[tokio::test]
+async fn push_to_talk_key_is_ignored_when_push_to_talk_is_off() {
+    let mut h = start(Devices::default(), FakeTransport::default());
+    h.join().await;
+    h.send(VoiceCommand::SetPushToTalkPressed(true));
+    h.send(VoiceCommand::SetMicrophoneMuted(true));
+    // No TransmittingChanged(true) from the key: the first event is the mute.
+    h.expect(&[
+        VoiceEvent::MicrophoneMutedChanged(true),
+        VoiceEvent::TransmittingChanged(false),
+    ])
     .await;
 }

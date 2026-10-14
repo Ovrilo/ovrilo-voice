@@ -55,6 +55,9 @@ impl VoiceEngine {
             transport_events: None,
             muted: false,
             deafened: false,
+            push_to_talk: false,
+            ptt_pressed: false,
+            transmitting: true,
             input: None,
             output: None,
             stats: stats_interval(),
@@ -74,6 +77,10 @@ struct Control<B: AudioBackend, T: Transport> {
     transport_events: Option<mpsc::UnboundedReceiver<TransportEvent>>,
     muted: bool,
     deafened: bool,
+    push_to_talk: bool,
+    ptt_pressed: bool,
+    /// Last reported [`VoiceEvent::TransmittingChanged`] value.
+    transmitting: bool,
     input: Option<DeviceId>,
     output: Option<DeviceId>,
     /// Paces [`VoiceEvent::StatsUpdated`]; restarted on every join.
@@ -130,6 +137,7 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
                     self.dsp.sync().await;
                     self.sync_session_mute().await;
                     self.emit(VoiceEvent::MicrophoneMutedChanged(muted));
+                    self.update_transmitting();
                 }
             }
             VoiceCommand::SetDeafened(deafened) => {
@@ -139,6 +147,25 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
                     self.dsp.sync().await;
                     self.sync_session_mute().await;
                     self.emit(VoiceEvent::DeafenedChanged(deafened));
+                    self.update_transmitting();
+                }
+            }
+            VoiceCommand::SetPushToTalk(enabled) => {
+                if enabled != self.push_to_talk {
+                    self.push_to_talk = enabled;
+                    self.ptt_pressed = false;
+                    self.dsp.send(DspCommand::SetPushToTalkPressed(false));
+                    self.dsp.send(DspCommand::SetPushToTalk(enabled));
+                    self.dsp.sync().await;
+                    self.emit(VoiceEvent::PushToTalkChanged(enabled));
+                    self.update_transmitting();
+                }
+            }
+            VoiceCommand::SetPushToTalkPressed(pressed) => {
+                if self.push_to_talk && pressed != self.ptt_pressed {
+                    self.ptt_pressed = pressed;
+                    self.dsp.send(DspCommand::SetPushToTalkPressed(pressed));
+                    self.update_transmitting();
                 }
             }
             VoiceCommand::SetInputDevice(device) => {
@@ -224,6 +251,15 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
                 self.dsp.send(DspCommand::SetPlayout(None));
                 self.emit(error.into());
             }
+        }
+    }
+
+    fn update_transmitting(&mut self) {
+        let transmitting =
+            !self.muted && !self.deafened && (!self.push_to_talk || self.ptt_pressed);
+        if transmitting != self.transmitting {
+            self.transmitting = transmitting;
+            self.emit(VoiceEvent::TransmittingChanged(transmitting));
         }
     }
 

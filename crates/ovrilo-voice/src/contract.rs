@@ -49,6 +49,11 @@ pub enum VoiceCommand {
     SetOutputDevice(Option<DeviceId>),
     /// Re-enumerates devices and emits [`VoiceEvent::DevicesChanged`].
     RefreshDevices,
+    /// Push-to-talk mode: the microphone transmits only while the key is held (plus a short
+    /// release tail). Off means open microphone (voice activity).
+    SetPushToTalk(bool),
+    /// State of the push-to-talk key, from the host's key watcher. Ignored when push-to-talk is off.
+    SetPushToTalkPressed(bool),
 }
 
 /// Notifications emitted by the engine. The engine is authoritative for this state (ADR-0011).
@@ -77,6 +82,10 @@ pub enum VoiceEvent {
     },
     /// Voice quality diagnostics, about once per second while in a room.
     StatsUpdated(VoiceStats),
+    PushToTalkChanged(bool),
+    /// Whether microphone audio is currently allowed out (not muted, not deafened, and the
+    /// push-to-talk key held when push-to-talk is on). Reported on changes.
+    TransmittingChanged(bool),
     /// Someone started or stopped talking (`participant: None` is the local user). Reported on
     /// transitions only; muted or deafened local audio never counts as speaking.
     SpeakingChanged {

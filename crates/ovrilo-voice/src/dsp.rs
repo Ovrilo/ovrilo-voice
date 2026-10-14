@@ -25,6 +25,8 @@ use crate::speaking::SpeakingDetector;
 const PLAYOUT_TARGET_MS: u32 = 40;
 /// Remote frames queued beyond this are dropped (oldest first) to bound latency.
 const MAX_REMOTE_QUEUE_FRAMES: usize = 10;
+/// Push-to-talk keeps transmitting this long after the key is released (end of the last word).
+const PTT_RELEASE_FRAMES: u32 = 20;
 /// Playout + capture device buffering guess added to the AEC delay hint.
 const DEVICE_LATENCY_GUESS_MS: u32 = 30;
 const IDLE_SLEEP: Duration = Duration::from_millis(2);
@@ -39,6 +41,8 @@ pub(crate) enum DspCommand {
     Reset,
     SetMuted(bool),
     SetDeafened(bool),
+    SetPushToTalk(bool),
+    SetPushToTalkPressed(bool),
     /// Replies once every earlier command has been applied (commands are processed in order).
     Barrier(tokio::sync::oneshot::Sender<()>),
 }
@@ -142,6 +146,10 @@ struct DspLoop {
     mixer: Mixer,
     muted: bool,
     deafened: bool,
+    push_to_talk: bool,
+    ptt_pressed: bool,
+    /// Frames still transmitted after the push-to-talk key was released.
+    ptt_tail: u32,
     counters: Arc<Counters>,
     /// Speaking indicators go straight to the host (unbounded send never blocks).
     events: mpsc::UnboundedSender<VoiceEvent>,
@@ -172,6 +180,9 @@ impl DspLoop {
             mixer: Mixer::default(),
             muted: false,
             deafened: false,
+            push_to_talk: false,
+            ptt_pressed: false,
+            ptt_tail: 0,
         }
     }
 
@@ -229,6 +240,16 @@ impl DspLoop {
                 if deafened {
                     self.silence_local();
                 }
+            }
+            DspCommand::SetPushToTalk(enabled) => {
+                self.push_to_talk = enabled;
+                self.ptt_tail = 0;
+            }
+            DspCommand::SetPushToTalkPressed(pressed) => {
+                if self.ptt_pressed && !pressed {
+                    self.ptt_tail = PTT_RELEASE_FRAMES;
+                }
+                self.ptt_pressed = pressed;
             }
             DspCommand::Barrier(reply) => {
                 let _ = reply.send(());
@@ -335,7 +356,16 @@ impl DspLoop {
             let delay =
                 self.playout.as_ref().map_or(0, |p| p.buffered_ms()) + DEVICE_LATENCY_GUESS_MS;
             self.processor.process_capture(frame, delay);
-            let change = if self.muted || self.deafened {
+            // The processor still sees every frame (AEC/AGC state stays converged).
+            let ptt_open = !self.push_to_talk || self.ptt_pressed || self.ptt_tail > 0;
+            if !self.ptt_pressed {
+                self.ptt_tail = self.ptt_tail.saturating_sub(1);
+            }
+            if !ptt_open {
+                // Silence keeps the outgoing stream continuous (Opus DTX makes it nearly free).
+                frame.fill(0);
+            }
+            let change = if self.muted || self.deafened || !ptt_open {
                 self.local_speaking.silence()
             } else {
                 self.local_speaking.update(frame)
