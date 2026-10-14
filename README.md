@@ -5,7 +5,7 @@ UI-independent Rust native voice engine for [Ovrilo](https://github.com/Ovrilo).
 ## Status
 
 - `crates/ovrilo-voice`: portable engine core: contract (`VoiceCommand`/`VoiceEvent`), state machine, control task, DSP thread, mixer, and the `AudioBackend`/`Transport`/`AudioProcessor` boundaries. Tested with fakes (no devices or network).
-- `crates/ovrilo-voice-cpal`: cpal (WASAPI) audio backend; lock-free ring buffers, per-device threads, 48 kHz devices for now.
+- `crates/ovrilo-voice-cpal`: cpal (WASAPI) audio backend; lock-free ring buffers, per-device threads; non-48 kHz devices are resampled (rubato FFT) on the DSP thread.
 - `crates/ovrilo-voice-livekit`: LiveKit transport and WebRTC audio processing; example `voice_room` joins a room with the real engine.
 - `crates/voice-spike`: Phase 02.1 development tool (not shipped) that validated LiveKit transport and app-owned microphone capture via cpal. Findings: [docs/spikes/2026-10-livekit-windows-audio.md](docs/spikes/2026-10-livekit-windows-audio.md); decision: ADR-0016 (Accepted).
 

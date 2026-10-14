@@ -4,14 +4,18 @@
 //! the engine gets only the `Send` ends of lock-free SPSC ring buffers. Real-time callbacks convert
 //! samples and push/pop the ring buffer: no locks, no allocation, no I/O.
 //!
-//! Devices must run at 48 kHz for now; other rates fail with `DeviceUnavailable` (resampling is a
-//! follow-up).
+//! Devices run at their own rate (the Windows shared-mode format). When it is not 48 kHz, the
+//! capture/playout streams convert on the engine's DSP thread (`resample`), not in callbacks.
 
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+
+mod resample;
+
+use resample::{RateConverter, to_f32, to_i16};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Host, SampleFormat, Stream, SupportedStreamConfig};
@@ -98,8 +102,17 @@ impl AudioBackend for CpalBackend {
         let config = device
             .default_input_config()
             .map_err(|e| VoiceError::device(format!("microphone format: {e}")))?;
-        require_48k(&config)?;
-        let (producer, consumer) = rtrb::RingBuffer::<i16>::new(SAMPLE_RATE as usize / 2);
+        let device_rate = config.sample_rate();
+        let converter = (device_rate != SAMPLE_RATE)
+            .then(|| RateConverter::new(device_rate, SAMPLE_RATE))
+            .transpose()?;
+        let pending = Vec::with_capacity(
+            FRAME_SAMPLES
+                + converter
+                    .as_ref()
+                    .map_or(0, RateConverter::max_block_output),
+        );
+        let (producer, consumer) = rtrb::RingBuffer::<i16>::new(device_rate as usize / 2);
         let overflow = Arc::new(AtomicU64::new(0));
         let overflow_cb = overflow.clone();
         let guard = DeviceThread::spawn("ovrilo-voice-capture", move || {
@@ -107,6 +120,8 @@ impl AudioBackend for CpalBackend {
         })?;
         Ok(Box::new(CpalCapture {
             consumer,
+            converter,
+            pending,
             overflow,
             _guard: guard,
         }))
@@ -117,8 +132,17 @@ impl AudioBackend for CpalBackend {
         let config = device
             .default_output_config()
             .map_err(|e| VoiceError::device(format!("speaker format: {e}")))?;
-        require_48k(&config)?;
-        let capacity = SAMPLE_RATE as usize / 2;
+        let device_rate = config.sample_rate();
+        let converter = (device_rate != SAMPLE_RATE)
+            .then(|| RateConverter::new(SAMPLE_RATE, device_rate))
+            .transpose()?;
+        let scratch = vec![
+            0;
+            converter
+                .as_ref()
+                .map_or(0, RateConverter::max_block_output)
+        ];
+        let capacity = device_rate as usize / 2;
         let (producer, consumer) = rtrb::RingBuffer::<i16>::new(capacity);
         let underruns = Arc::new(AtomicU64::new(0));
         let underruns_cb = underruns.clone();
@@ -127,21 +151,13 @@ impl AudioBackend for CpalBackend {
         })?;
         Ok(Box::new(CpalPlayout {
             producer,
+            converter,
+            scratch,
             capacity,
+            device_rate,
             underruns,
             _guard: guard,
         }))
-    }
-}
-
-fn require_48k(config: &SupportedStreamConfig) -> Result<(), VoiceError> {
-    if config.sample_rate() == SAMPLE_RATE {
-        Ok(())
-    } else {
-        Err(VoiceError::device(format!(
-            "device runs at {} Hz; 48000 Hz is required (set it in Windows sound settings)",
-            config.sample_rate()
-        )))
     }
 }
 
@@ -202,19 +218,41 @@ impl Drop for DeviceThread {
 
 struct CpalCapture {
     consumer: rtrb::Consumer<i16>,
+    /// Device rate → 48 kHz, when the device is not at 48 kHz.
+    converter: Option<RateConverter>,
+    /// Converted 48 kHz samples not yet returned as a frame.
+    pending: Vec<f32>,
     overflow: Arc<AtomicU64>,
     _guard: DeviceThread,
 }
 
 impl CaptureStream for CpalCapture {
     fn read_frame(&mut self, out: &mut Frame) -> bool {
-        let Ok(chunk) = self.consumer.read_chunk(FRAME_SAMPLES) else {
-            return false;
+        let Some(converter) = &mut self.converter else {
+            let Ok(chunk) = self.consumer.read_chunk(FRAME_SAMPLES) else {
+                return false;
+            };
+            let (first, second) = chunk.as_slices();
+            out[..first.len()].copy_from_slice(first);
+            out[first.len()..].copy_from_slice(second);
+            chunk.commit_all();
+            return true;
         };
-        let (first, second) = chunk.as_slices();
-        out[..first.len()].copy_from_slice(first);
-        out[first.len()..].copy_from_slice(second);
-        chunk.commit_all();
+        let pending = &mut self.pending;
+        while pending.len() < FRAME_SAMPLES {
+            // Pull exactly one converter block at a time so `pending` never outgrows its capacity.
+            let Ok(chunk) = self.consumer.read_chunk(converter.needed()) else {
+                return false;
+            };
+            let (first, second) = chunk.as_slices();
+            converter.push(first.iter().chain(second).map(|&s| to_f32(s)), |block| {
+                pending.extend_from_slice(block)
+            });
+            chunk.commit_all();
+        }
+        for (sample, converted) in out.iter_mut().zip(pending.drain(..FRAME_SAMPLES)) {
+            *sample = to_i16(converted);
+        }
         true
     }
 
@@ -225,7 +263,11 @@ impl CaptureStream for CpalCapture {
 
 struct CpalPlayout {
     producer: rtrb::Producer<i16>,
+    /// 48 kHz → device rate, when the device is not at 48 kHz.
+    converter: Option<RateConverter>,
+    scratch: Vec<i16>,
     capacity: usize,
+    device_rate: u32,
     underruns: Arc<AtomicU64>,
     _guard: DeviceThread,
 }
@@ -233,12 +275,23 @@ struct CpalPlayout {
 impl PlayoutStream for CpalPlayout {
     fn write_frame(&mut self, frame: &Frame) {
         // Drops what does not fit; the consumer trims latency, so this only happens if playout stalls.
-        let _ = self.producer.push_partial_slice(frame);
+        let Some(converter) = &mut self.converter else {
+            let _ = self.producer.push_partial_slice(frame);
+            return;
+        };
+        let (producer, scratch) = (&mut self.producer, &mut self.scratch);
+        converter.push(frame.iter().map(|&s| to_f32(s)), |block| {
+            for (out, &sample) in scratch.iter_mut().zip(block) {
+                *out = to_i16(sample);
+            }
+            let _ = producer.push_partial_slice(&scratch[..block.len()]);
+        });
     }
 
     fn buffered_ms(&self) -> u32 {
         let buffered = self.capacity - self.producer.slots();
-        (buffered as u64 * 1000 / u64::from(SAMPLE_RATE)) as u32
+        let converter_ms = self.converter.as_ref().map_or(0, RateConverter::delay_ms);
+        (buffered as u64 * 1000 / u64::from(self.device_rate)) as u32 + converter_ms
     }
 
     fn underruns(&self) -> u64 {
@@ -303,8 +356,9 @@ fn build_output(
     underruns: Arc<AtomicU64>,
 ) -> Result<Stream, VoiceError> {
     let channels = usize::from(config.channels()).max(1);
-    let prebuffer = (SAMPLE_RATE * PREBUFFER_MS / 1000) as usize;
-    let max_fill = (SAMPLE_RATE * MAX_PLAYOUT_FILL_MS / 1000) as usize;
+    let device_rate = config.sample_rate();
+    let prebuffer = (device_rate * PREBUFFER_MS / 1000) as usize;
+    let max_fill = (device_rate * MAX_PLAYOUT_FILL_MS / 1000) as usize;
     let mut playing = false;
     let on_error = |e| eprintln!("ovrilo-voice playout error: {e}");
 
