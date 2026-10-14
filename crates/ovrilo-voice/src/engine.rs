@@ -3,11 +3,16 @@
 //! Hosts send [`VoiceCommand`]s through [`VoiceEngineHandle`] and read [`VoiceEvent`]s. The engine
 //! is authoritative for voice state; a state change is reported only after it has been applied.
 
+use std::time::Duration;
+
 use tokio::sync::mpsc;
 
 use crate::ConnectionState;
 use crate::audio::{AudioBackend, ProcessorFactory};
 use crate::contract::{DeviceId, VoiceCommand, VoiceError, VoiceErrorCode, VoiceEvent};
+
+/// How often [`VoiceEvent::StatsUpdated`] is emitted while in a room.
+const STATS_INTERVAL: Duration = Duration::from_secs(1);
 use crate::dsp::{Dsp, DspCommand};
 use crate::transport::{Connected, Transport, TransportEvent, TransportSession};
 
@@ -43,7 +48,7 @@ impl VoiceEngine {
         let control = Control {
             backend,
             transport,
-            dsp: Dsp::spawn(processor),
+            dsp: Dsp::spawn(processor, event_tx.clone()),
             events: event_tx,
             state: ConnectionState::Disconnected,
             session: None,
@@ -52,6 +57,7 @@ impl VoiceEngine {
             deafened: false,
             input: None,
             output: None,
+            stats: stats_interval(),
         };
         tokio::spawn(control.run(command_rx));
         (VoiceEngineHandle { commands }, events)
@@ -70,6 +76,15 @@ struct Control<B: AudioBackend, T: Transport> {
     deafened: bool,
     input: Option<DeviceId>,
     output: Option<DeviceId>,
+    /// Paces [`VoiceEvent::StatsUpdated`]; restarted on every join.
+    stats: tokio::time::Interval,
+}
+
+fn stats_interval() -> tokio::time::Interval {
+    let mut interval =
+        tokio::time::interval_at(tokio::time::Instant::now() + STATS_INTERVAL, STATS_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
 }
 
 impl<B: AudioBackend, T: Transport> Control<B, T> {
@@ -81,6 +96,7 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
                     None => break,
                 },
                 Some(event) = next_event(&mut self.transport_events) => self.handle_transport_event(event).await,
+                _ = self.stats.tick(), if self.session.is_some() => self.emit_stats().await,
             }
         }
         self.leave().await;
@@ -175,6 +191,7 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
                 self.open_output();
                 self.open_input();
                 self.sync_session_mute().await;
+                self.stats.reset();
                 self.set_state(ConnectionState::Connected);
             }
             Err(error) => {
@@ -208,6 +225,15 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
                 self.emit(error.into());
             }
         }
+    }
+
+    async fn emit_stats(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let mut stats = self.dsp.stats();
+        stats.network = session.network_stats().await;
+        self.emit(VoiceEvent::StatsUpdated(stats));
     }
 
     async fn sync_session_mute(&mut self) {

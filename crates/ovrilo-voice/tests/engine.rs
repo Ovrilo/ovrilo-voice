@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use ovrilo_voice::audio::FRAME_SAMPLES;
 use ovrilo_voice::{
     AudioBackend, AudioDevice, CaptureStream, Connected, ConnectionState, DeviceId, Frame,
-    NoProcessing, ParticipantId, PlayoutStream, Transport, TransportEvent, TransportSession,
-    VoiceCommand, VoiceEngine, VoiceEngineHandle, VoiceError, VoiceErrorCode, VoiceEvent,
+    NetworkStats, NoProcessing, ParticipantId, PlayoutStream, Transport, TransportEvent,
+    TransportSession, VoiceCommand, VoiceEngine, VoiceEngineHandle, VoiceError, VoiceErrorCode,
+    VoiceEvent,
 };
 use tokio::sync::mpsc;
 
@@ -144,6 +145,13 @@ impl TransportSession for FakeSession {
     async fn close(self) {
         self.0.lock().unwrap().closed = true;
     }
+
+    async fn network_stats(&self) -> NetworkStats {
+        let mut stats = NetworkStats::default();
+        stats.round_trip_ms = Some(42);
+        stats.inbound_concealed_ms = 30;
+        stats
+    }
 }
 
 // ---------- helpers ----------
@@ -174,7 +182,17 @@ impl Harness {
         assert!(self.handle.send(command));
     }
 
+    /// Next event other than the periodic [`VoiceEvent::StatsUpdated`].
     async fn next(&mut self) -> VoiceEvent {
+        loop {
+            match self.next_any().await {
+                VoiceEvent::StatsUpdated(_) => continue,
+                event => return event,
+            }
+        }
+    }
+
+    async fn next_any(&mut self) -> VoiceEvent {
         tokio::time::timeout(Duration::from_secs(2), self.events.recv())
             .await
             .expect("timed out waiting for an engine event")
@@ -477,4 +495,90 @@ async fn refresh_devices_lists_inputs_and_outputs() {
         }
         other => panic!("unexpected {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn stats_report_network_and_dropped_remote_audio() {
+    let mut h = start(Devices::default(), FakeTransport::default());
+    h.join().await;
+    let (tx, rx) = mpsc::channel(64);
+    h.room_event(TransportEvent::RemoteAudioStarted {
+        id: ParticipantId("a".into()),
+        frames: rx,
+    });
+    // Far more than the engine keeps queued, faster than playout drains it.
+    for _ in 0..60 {
+        tx.send([1; FRAME_SAMPLES]).await.unwrap();
+    }
+
+    let stats = loop {
+        if let VoiceEvent::StatsUpdated(stats) = h.next_any().await {
+            break stats;
+        }
+    };
+
+    assert_eq!(stats.network.round_trip_ms, Some(42));
+    assert_eq!(stats.network.inbound_concealed_ms, 30);
+    assert!(
+        stats.remote_frames_dropped > 0,
+        "excess remote frames are counted: {stats:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_stats_outside_a_room() {
+    let mut h = start(Devices::default(), FakeTransport::default());
+    h.join().await;
+    h.send(VoiceCommand::Leave);
+    h.expect(&[VoiceEvent::ConnectionStateChanged(
+        ConnectionState::Disconnected,
+    )])
+    .await;
+
+    let next = tokio::time::timeout(Duration::from_millis(1500), h.events.recv()).await;
+    assert!(next.is_err(), "unexpected event after leaving: {next:?}");
+}
+
+#[tokio::test]
+async fn speaking_is_reported_for_self_and_remotes_and_cleared_when_muted() {
+    let mut h = start(Devices::default(), FakeTransport::default());
+    h.join().await;
+
+    h.speak(3000, 4);
+    h.expect(&[VoiceEvent::SpeakingChanged {
+        participant: None,
+        speaking: true,
+    }])
+    .await;
+    h.send(VoiceCommand::SetMicrophoneMuted(true));
+    h.expect(&[
+        VoiceEvent::SpeakingChanged {
+            participant: None,
+            speaking: false,
+        },
+        VoiceEvent::MicrophoneMutedChanged(true),
+    ])
+    .await;
+
+    let (tx, rx) = mpsc::channel(20);
+    h.room_event(TransportEvent::RemoteAudioStarted {
+        id: ParticipantId("a".into()),
+        frames: rx,
+    });
+    for _ in 0..4 {
+        tx.send([3000; FRAME_SAMPLES]).await.unwrap();
+    }
+    h.expect(&[VoiceEvent::SpeakingChanged {
+        participant: Some(ParticipantId("a".into())),
+        speaking: true,
+    }])
+    .await;
+    h.room_event(TransportEvent::RemoteAudioEnded {
+        id: ParticipantId("a".into()),
+    });
+    h.expect(&[VoiceEvent::SpeakingChanged {
+        participant: Some(ParticipantId("a".into())),
+        speaking: false,
+    }])
+    .await;
 }

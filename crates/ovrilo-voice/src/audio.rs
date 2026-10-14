@@ -48,6 +48,10 @@ pub trait PlayoutStream: Send {
     fn underruns(&self) -> u64 {
         0
     }
+    /// Audio dropped by the device side to bound latency, in milliseconds.
+    fn skipped_ms(&self) -> u64 {
+        0
+    }
 }
 
 /// Echo cancellation / gain control / noise suppression applied on the DSP thread.

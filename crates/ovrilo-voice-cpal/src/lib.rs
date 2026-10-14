@@ -145,9 +145,13 @@ impl AudioBackend for CpalBackend {
         let capacity = device_rate as usize / 2;
         let (producer, consumer) = rtrb::RingBuffer::<i16>::new(capacity);
         let underruns = Arc::new(AtomicU64::new(0));
-        let underruns_cb = underruns.clone();
+        let skipped_samples = Arc::new(AtomicU64::new(0));
+        let counters = PlayoutCounters {
+            underruns: underruns.clone(),
+            skipped_samples: skipped_samples.clone(),
+        };
         let guard = DeviceThread::spawn("ovrilo-voice-playout", move || {
-            build_output(&device, &config, consumer, underruns_cb)
+            build_output(&device, &config, consumer, counters)
         })?;
         Ok(Box::new(CpalPlayout {
             producer,
@@ -156,6 +160,7 @@ impl AudioBackend for CpalBackend {
             capacity,
             device_rate,
             underruns,
+            skipped_samples,
             _guard: guard,
         }))
     }
@@ -269,7 +274,14 @@ struct CpalPlayout {
     capacity: usize,
     device_rate: u32,
     underruns: Arc<AtomicU64>,
+    skipped_samples: Arc<AtomicU64>,
     _guard: DeviceThread,
+}
+
+/// Counters updated by the playout callback (atomic adds only).
+struct PlayoutCounters {
+    underruns: Arc<AtomicU64>,
+    skipped_samples: Arc<AtomicU64>,
 }
 
 impl PlayoutStream for CpalPlayout {
@@ -296,6 +308,10 @@ impl PlayoutStream for CpalPlayout {
 
     fn underruns(&self) -> u64 {
         self.underruns.load(Ordering::Relaxed)
+    }
+
+    fn skipped_ms(&self) -> u64 {
+        self.skipped_samples.load(Ordering::Relaxed) * 1000 / u64::from(self.device_rate)
     }
 }
 
@@ -353,7 +369,7 @@ fn build_output(
     device: &Device,
     config: &SupportedStreamConfig,
     mut consumer: rtrb::Consumer<i16>,
-    underruns: Arc<AtomicU64>,
+    counters: PlayoutCounters,
 ) -> Result<Stream, VoiceError> {
     let channels = usize::from(config.channels()).max(1);
     let device_rate = config.sample_rate();
@@ -369,6 +385,9 @@ fn build_output(
             if fill > max_fill
                 && let Ok(chunk) = consumer.read_chunk(fill - prebuffer)
             {
+                counters
+                    .skipped_samples
+                    .fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 chunk.commit_all();
             }
         }
@@ -380,7 +399,7 @@ fn build_output(
         }
         consumer.pop().unwrap_or_else(|_| {
             playing = false;
-            underruns.fetch_add(1, Ordering::Relaxed);
+            counters.underruns.fetch_add(1, Ordering::Relaxed);
             0
         })
     };

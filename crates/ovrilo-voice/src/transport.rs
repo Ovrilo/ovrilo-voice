@@ -7,7 +7,7 @@ use std::future::Future;
 use tokio::sync::mpsc;
 
 use crate::audio::Frame;
-use crate::contract::{ParticipantId, VoiceError};
+use crate::contract::{NetworkStats, ParticipantId, VoiceError};
 
 /// Connects to rooms. One transport can create many sessions over the engine's lifetime.
 pub trait Transport: Send + Sync + 'static {
@@ -35,6 +35,10 @@ pub trait TransportSession: Send + 'static {
     fn set_microphone_muted(&mut self, muted: bool) -> impl Future<Output = ()> + Send;
     /// Leaves the room and releases network resources.
     fn close(self) -> impl Future<Output = ()> + Send;
+    /// Current network diagnostics; transports without statistics report defaults.
+    fn network_stats(&self) -> impl Future<Output = NetworkStats> + Send {
+        std::future::ready(NetworkStats::default())
+    }
 }
 
 /// Room events delivered to the engine.

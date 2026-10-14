@@ -75,6 +75,49 @@ pub enum VoiceEvent {
         code: VoiceErrorCode,
         message: String,
     },
+    /// Voice quality diagnostics, about once per second while in a room.
+    StatsUpdated(VoiceStats),
+    /// Someone started or stopped talking (`participant: None` is the local user). Reported on
+    /// transitions only; muted or deafened local audio never counts as speaking.
+    SpeakingChanged {
+        participant: Option<ParticipantId>,
+        speaking: bool,
+    },
+}
+
+/// Diagnostics for the current room. Counters are cumulative since joining.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct VoiceStats {
+    /// Audio queued for the speaker right now.
+    pub playout_buffered_ms: u32,
+    /// Times the speaker ran out of audio (heard as gaps).
+    pub playout_underruns: u64,
+    /// Audio skipped to bound latency when playout fell behind (heard as jumps).
+    pub playout_skipped_ms: u64,
+    /// Microphone audio lost because the engine did not drain capture in time.
+    pub capture_overflow_ms: u64,
+    /// Remote 10 ms frames dropped because a participant's queue was full.
+    pub remote_frames_dropped: u64,
+    /// Microphone 10 ms frames dropped because the network side was behind.
+    pub microphone_frames_dropped: u64,
+    pub network: NetworkStats,
+}
+
+/// Network-side diagnostics reported by the transport. Counters are cumulative.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct NetworkStats {
+    /// Round-trip time to the media server.
+    pub round_trip_ms: Option<u32>,
+    pub inbound_packets_received: u64,
+    pub inbound_packets_lost: u64,
+    /// Largest inbound jitter across remote participants.
+    pub inbound_jitter_ms: Option<u32>,
+    /// Remote audio synthesized to hide loss or late packets (heard as robotic voice).
+    pub inbound_concealed_ms: u64,
+    /// Our packets the server reports as lost.
+    pub outbound_packets_lost: u64,
 }
 
 /// Stable, host-facing error categories. Hosts branch on the code, never on the message.

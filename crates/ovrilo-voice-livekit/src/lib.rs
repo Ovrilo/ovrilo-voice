@@ -4,7 +4,7 @@
 //! `NativeAudioSource` fed by the engine; remote tracks are read with `NativeAudioStream`. WebRTC's
 //! platform audio device module is not used (see ADR-0016).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use futures_util::StreamExt;
 use livekit::options::TrackPublishOptions;
@@ -14,10 +14,11 @@ use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
 use livekit::webrtc::native::apm::AudioProcessingModule;
+use livekit::webrtc::stats::{IceCandidatePairState, RtcStats};
 use ovrilo_voice::audio::{FRAME_SAMPLES, SAMPLE_RATE};
 use ovrilo_voice::{
-    AudioProcessor, Connected, Frame, ParticipantId, ProcessorFactory, Transport, TransportEvent,
-    TransportSession, VoiceError,
+    AudioProcessor, Connected, Frame, NetworkStats, ParticipantId, ProcessorFactory, Transport,
+    TransportEvent, TransportSession, VoiceError,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -114,6 +115,72 @@ impl TransportSession for LiveKitSession {
         }
         let _ = self.room.close().await;
     }
+
+    async fn network_stats(&self) -> NetworkStats {
+        match self.room.get_stats().await {
+            Ok(session) => network_stats(&session.publisher_stats, &session.subscriber_stats),
+            Err(_) => NetworkStats::default(),
+        }
+    }
+}
+
+/// Summarizes WebRTC statistics: inbound audio from remote tracks, outbound loss as reported back
+/// by the server, and the round-trip time of the active candidate pair. Depending on the SDK's
+/// peer-connection mode, entries can appear in either list, so both are scanned (once per id).
+fn network_stats(publisher: &[RtcStats], subscriber: &[RtcStats]) -> NetworkStats {
+    let mut stats = NetworkStats::default();
+    let mut jitter_s: Option<f64> = None;
+    let mut pair_rtt: Option<(bool, f64)> = None;
+    let mut remote_rtt: Option<f64> = None;
+    let mut seen = HashSet::new();
+    for entry in publisher.iter().chain(subscriber) {
+        match entry {
+            RtcStats::InboundRtp(rtp)
+                if rtp.stream.kind == "audio" && seen.insert(rtp.rtc.id.as_str()) =>
+            {
+                stats.inbound_packets_received += rtp.received.packets_received;
+                stats.inbound_packets_lost += rtp.received.packets_lost.max(0) as u64;
+                jitter_s = Some(jitter_s.unwrap_or(0.0).max(rtp.received.jitter));
+                // Concealment during DTX silence is inaudible; count only audible concealment.
+                let audible = rtp
+                    .inbound
+                    .concealed_samples
+                    .saturating_sub(rtp.inbound.silent_concealed_samples);
+                stats.inbound_concealed_ms += audible * 1000 / u64::from(SAMPLE_RATE);
+            }
+            RtcStats::RemoteInboundRtp(remote)
+                if remote.stream.kind == "audio" && seen.insert(remote.rtc.id.as_str()) =>
+            {
+                stats.outbound_packets_lost += remote.received.packets_lost.max(0) as u64;
+                if remote.remote_inbound.round_trip_time > 0.0 {
+                    remote_rtt = Some(remote.remote_inbound.round_trip_time);
+                }
+            }
+            // The SDK does not always flag the active pair as nominated; a succeeded pair is
+            // in use too. Prefer nominated pairs.
+            RtcStats::CandidatePair(pair)
+                if pair.candidate_pair.current_round_trip_time > 0.0
+                    && (pair.candidate_pair.nominated
+                        || pair.candidate_pair.state == Some(IceCandidatePairState::Succeeded)) =>
+            {
+                let candidate = (
+                    pair.candidate_pair.nominated,
+                    pair.candidate_pair.current_round_trip_time,
+                );
+                if pair_rtt.is_none_or(|(nominated, _)| candidate.0 && !nominated) {
+                    pair_rtt = Some(candidate);
+                }
+            }
+            _ => {}
+        }
+    }
+    // ICE round trip is the network RTT; RTCP-based RTT also includes server processing.
+    stats.round_trip_ms = pair_rtt
+        .map(|(_, rtt)| rtt)
+        .or(remote_rtt)
+        .map(|rtt| (rtt * 1000.0) as u32);
+    stats.inbound_jitter_ms = jitter_s.map(|s| (s * 1000.0) as u32);
+    stats
 }
 
 fn joined(participant: &RemoteParticipant) -> TransportEvent {
@@ -278,5 +345,73 @@ impl AudioProcessor for WebRtcProcessor {
             let _ = self.apm.set_stream_delay_ms(playout_delay_ms as i32);
         }
         let _ = self.apm.process_stream(frame, SAMPLE_RATE as i32, 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use livekit::webrtc::stats::{CandidatePairStats, InboundRtpStats, RemoteInboundRtpStats};
+
+    use super::*;
+
+    fn inbound(
+        kind: &str,
+        received: u64,
+        lost: i64,
+        jitter: f64,
+        concealed: u64,
+        silent: u64,
+    ) -> RtcStats {
+        let mut rtp = InboundRtpStats::default();
+        rtp.rtc.id = format!("in-{kind}-{received}");
+        rtp.stream.kind = kind.into();
+        rtp.received.packets_received = received;
+        rtp.received.packets_lost = lost;
+        rtp.received.jitter = jitter;
+        rtp.inbound.concealed_samples = concealed;
+        rtp.inbound.silent_concealed_samples = silent;
+        RtcStats::InboundRtp(rtp)
+    }
+
+    #[test]
+    fn summarizes_audio_streams_and_round_trip() {
+        let mut pair = CandidatePairStats::default();
+        pair.candidate_pair.nominated = true;
+        pair.candidate_pair.current_round_trip_time = 0.045;
+        let subscriber = [
+            inbound("audio", 1000, 10, 0.004, 4800 + 960, 960),
+            inbound("audio", 500, -1, 0.012, 0, 0),
+            inbound("video", 9999, 99, 0.5, 0, 0),
+            RtcStats::CandidatePair(pair),
+        ];
+        let mut remote = RemoteInboundRtpStats::default();
+        remote.stream.kind = "audio".into();
+        remote.received.packets_lost = 3;
+
+        let stats = network_stats(&[RtcStats::RemoteInboundRtp(remote)], &subscriber);
+        let single_pc = network_stats(&[subscriber.as_slice(), &[]].concat(), &[]);
+        assert_eq!(
+            single_pc.inbound_packets_received, 1500,
+            "entries in the publisher list count"
+        );
+
+        assert_eq!(stats.inbound_packets_received, 1500);
+        assert_eq!(
+            stats.inbound_packets_lost, 10,
+            "negative loss (duplicates) counts as 0"
+        );
+        assert_eq!(stats.inbound_jitter_ms, Some(12), "worst participant");
+        assert_eq!(
+            stats.inbound_concealed_ms, 100,
+            "silent concealment excluded"
+        );
+        assert_eq!(stats.outbound_packets_lost, 3);
+        assert_eq!(stats.round_trip_ms, Some(45));
+    }
+
+    #[test]
+    fn empty_stats_report_nothing() {
+        let stats = network_stats(&[], &[]);
+        assert_eq!(stats, NetworkStats::default());
     }
 }

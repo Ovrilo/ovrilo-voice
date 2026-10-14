@@ -6,15 +6,20 @@
 //! This is not a real-time callback (those live in the backend); it may block briefly and sleeps
 //! when idle. Mixing is paced by the playout buffer so latency does not grow with participants.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::audio::{CaptureStream, FRAME_SAMPLES, Frame, PlayoutStream, ProcessorFactory};
-use crate::contract::ParticipantId;
+use crate::audio::{
+    CaptureStream, FRAME_SAMPLES, Frame, PlayoutStream, ProcessorFactory, SAMPLE_RATE,
+};
+use crate::contract::{ParticipantId, VoiceEvent, VoiceStats};
 use crate::mixer::Mixer;
+use crate::speaking::SpeakingDetector;
 
 /// Playout fill the mixer keeps; frames are mixed whenever the buffer drops below it.
 const PLAYOUT_TARGET_MS: u32 = 40;
@@ -41,18 +46,66 @@ pub(crate) enum DspCommand {
 pub(crate) struct Dsp {
     commands: std_mpsc::Sender<DspCommand>,
     handle: Option<JoinHandle<()>>,
+    counters: Arc<Counters>,
+}
+
+/// Diagnostics written by the DSP thread and read by the control task (lock-free).
+#[derive(Default)]
+struct Counters {
+    playout_buffered_ms: AtomicU32,
+    playout_underruns: AtomicU64,
+    playout_skipped_ms: AtomicU64,
+    capture_overflow_samples: AtomicU64,
+    remote_frames_dropped: AtomicU64,
+    microphone_frames_dropped: AtomicU64,
+}
+
+impl Counters {
+    fn reset(&self) {
+        for counter in [
+            &self.playout_underruns,
+            &self.playout_skipped_ms,
+            &self.capture_overflow_samples,
+            &self.remote_frames_dropped,
+            &self.microphone_frames_dropped,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+        self.playout_buffered_ms.store(0, Ordering::Relaxed);
+    }
 }
 
 impl Dsp {
-    pub(crate) fn spawn(processor: ProcessorFactory) -> Self {
+    pub(crate) fn spawn(
+        processor: ProcessorFactory,
+        events: mpsc::UnboundedSender<VoiceEvent>,
+    ) -> Self {
         let (commands, receiver) = std_mpsc::channel();
+        let counters = Arc::new(Counters::default());
+        let loop_counters = counters.clone();
         let handle = thread::Builder::new()
             .name("ovrilo-voice-dsp".into())
-            .spawn(move || DspLoop::new(processor()).run(&receiver))
+            .spawn(move || DspLoop::new(processor(), loop_counters, events).run(&receiver))
             .expect("spawn DSP thread");
         Self {
             commands,
             handle: Some(handle),
+            counters,
+        }
+    }
+
+    /// Engine-side diagnostics; network fields are filled in by the caller.
+    pub(crate) fn stats(&self) -> VoiceStats {
+        let c = &self.counters;
+        VoiceStats {
+            playout_buffered_ms: c.playout_buffered_ms.load(Ordering::Relaxed),
+            playout_underruns: c.playout_underruns.load(Ordering::Relaxed),
+            playout_skipped_ms: c.playout_skipped_ms.load(Ordering::Relaxed),
+            capture_overflow_ms: c.capture_overflow_samples.load(Ordering::Relaxed) * 1000
+                / u64::from(SAMPLE_RATE),
+            remote_frames_dropped: c.remote_frames_dropped.load(Ordering::Relaxed),
+            microphone_frames_dropped: c.microphone_frames_dropped.load(Ordering::Relaxed),
+            network: Default::default(),
         }
     }
 
@@ -85,15 +138,32 @@ struct DspLoop {
     capture: Option<Box<dyn CaptureStream>>,
     playout: Option<Box<dyn PlayoutStream>>,
     microphone: Option<mpsc::Sender<Frame>>,
-    remotes: Vec<(ParticipantId, mpsc::Receiver<Frame>)>,
+    remotes: Vec<Remote>,
     mixer: Mixer,
     muted: bool,
     deafened: bool,
+    counters: Arc<Counters>,
+    /// Speaking indicators go straight to the host (unbounded send never blocks).
+    events: mpsc::UnboundedSender<VoiceEvent>,
+    local_speaking: SpeakingDetector,
+}
+
+struct Remote {
+    id: ParticipantId,
+    frames: mpsc::Receiver<Frame>,
+    speaking: SpeakingDetector,
 }
 
 impl DspLoop {
-    fn new(processor: Box<dyn crate::audio::AudioProcessor>) -> Self {
+    fn new(
+        processor: Box<dyn crate::audio::AudioProcessor>,
+        counters: Arc<Counters>,
+        events: mpsc::UnboundedSender<VoiceEvent>,
+    ) -> Self {
         Self {
+            events,
+            local_speaking: SpeakingDetector::default(),
+            counters,
             processor,
             capture: None,
             playout: None,
@@ -117,6 +187,7 @@ impl DspLoop {
             }
             let rendered = self.render(&mut frame);
             let captured = self.capture(&mut frame);
+            self.publish_device_counters();
             if !rendered && !captured {
                 thread::sleep(IDLE_SLEEP);
             }
@@ -129,40 +200,101 @@ impl DspLoop {
             DspCommand::SetPlayout(playout) => self.playout = playout,
             DspCommand::SetMicrophoneSink(sink) => self.microphone = sink,
             DspCommand::AddRemote(id, frames) => {
-                self.remotes.retain(|(existing, _)| *existing != id);
-                self.remotes.push((id, frames));
+                self.remove_remote(&id);
+                self.remotes.push(Remote {
+                    id,
+                    frames,
+                    speaking: SpeakingDetector::default(),
+                });
             }
-            DspCommand::RemoveRemote(id) => self.remotes.retain(|(existing, _)| *existing != id),
+            DspCommand::RemoveRemote(id) => self.remove_remote(&id),
             DspCommand::Reset => {
                 self.capture = None;
                 self.playout = None;
                 self.microphone = None;
-                self.remotes.clear();
+                for remote in std::mem::take(&mut self.remotes) {
+                    self.end_remote(remote);
+                }
+                self.silence_local();
+                self.counters.reset();
             }
-            DspCommand::SetMuted(muted) => self.muted = muted,
-            DspCommand::SetDeafened(deafened) => self.deafened = deafened,
+            DspCommand::SetMuted(muted) => {
+                self.muted = muted;
+                if muted {
+                    self.silence_local();
+                }
+            }
+            DspCommand::SetDeafened(deafened) => {
+                self.deafened = deafened;
+                if deafened {
+                    self.silence_local();
+                }
+            }
             DspCommand::Barrier(reply) => {
                 let _ = reply.send(());
             }
         }
     }
 
+    fn emit_speaking(&self, participant: Option<ParticipantId>, change: Option<bool>) {
+        if let Some(speaking) = change {
+            let _ = self.events.send(VoiceEvent::SpeakingChanged {
+                participant,
+                speaking,
+            });
+        }
+    }
+
+    fn silence_local(&mut self) {
+        let change = self.local_speaking.silence();
+        self.emit_speaking(None, change);
+    }
+
+    fn remove_remote(&mut self, id: &ParticipantId) {
+        if let Some(index) = self.remotes.iter().position(|r| r.id == *id) {
+            let remote = self.remotes.swap_remove(index);
+            self.end_remote(remote);
+        }
+    }
+
+    fn end_remote(&self, mut remote: Remote) {
+        let change = remote.speaking.silence();
+        self.emit_speaking(Some(remote.id), change);
+    }
+
     /// Mixes one frame when playout needs audio. Returns whether work was done.
     fn render(&mut self, frame: &mut Frame) -> bool {
         // Bound per-remote latency and drop streams whose track ended.
-        self.remotes.retain_mut(|(_, frames)| {
-            while frames.len() > MAX_REMOTE_QUEUE_FRAMES {
-                let _ = frames.try_recv();
+        let mut index = 0;
+        while index < self.remotes.len() {
+            let remote = &mut self.remotes[index];
+            while remote.frames.len() > MAX_REMOTE_QUEUE_FRAMES {
+                if remote.frames.try_recv().is_ok() {
+                    self.counters
+                        .remote_frames_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
-            !frames.is_closed() || !frames.is_empty()
-        });
+            if remote.frames.is_closed() && remote.frames.is_empty() {
+                let ended = self.remotes.swap_remove(index);
+                self.end_remote(ended);
+            } else {
+                index += 1;
+            }
+        }
 
         let Some(playout) = self.playout.as_mut() else {
-            // No speaker: keep remote queues drained so they do not grow.
+            // No speaker: keep remote queues drained so they do not grow (still tracking speech).
             let mut drained = false;
-            for (_, frames) in &mut self.remotes {
-                while frames.try_recv().is_ok() {
+            for remote in &mut self.remotes {
+                while let Ok(audio) = remote.frames.try_recv() {
                     drained = true;
+                    if let Some(speaking) = remote.speaking.update(&audio) {
+                        let _ = self.events.send(VoiceEvent::SpeakingChanged {
+                            participant: Some(remote.id.clone()),
+                            speaking,
+                        });
+                    }
                 }
             }
             return drained;
@@ -171,9 +303,15 @@ impl DspLoop {
             return false;
         }
 
-        for (_, frames) in &mut self.remotes {
-            if let Ok(remote) = frames.try_recv() {
-                self.mixer.add(&remote);
+        for remote in &mut self.remotes {
+            if let Ok(audio) = remote.frames.try_recv() {
+                if let Some(speaking) = remote.speaking.update(&audio) {
+                    let _ = self.events.send(VoiceEvent::SpeakingChanged {
+                        participant: Some(remote.id.clone()),
+                        speaking,
+                    });
+                }
+                self.mixer.add(&audio);
             }
         }
         self.mixer.finish(frame);
@@ -197,14 +335,46 @@ impl DspLoop {
             let delay =
                 self.playout.as_ref().map_or(0, |p| p.buffered_ms()) + DEVICE_LATENCY_GUESS_MS;
             self.processor.process_capture(frame, delay);
+            let change = if self.muted || self.deafened {
+                self.local_speaking.silence()
+            } else {
+                self.local_speaking.update(frame)
+            };
+            if let Some(speaking) = change {
+                let _ = self.events.send(VoiceEvent::SpeakingChanged {
+                    participant: None,
+                    speaking,
+                });
+            }
             if !self.muted
                 && !self.deafened
                 && let Some(microphone) = &self.microphone
             {
                 // A full channel means the transport is behind; dropping one frame is the least-bad option.
-                let _ = microphone.try_send(*frame);
+                if microphone.try_send(*frame).is_err() {
+                    self.counters
+                        .microphone_frames_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         worked
+    }
+
+    /// Copies the device streams' counters (cheap atomic reads) for the control task.
+    fn publish_device_counters(&self) {
+        let c = &self.counters;
+        if let Some(playout) = &self.playout {
+            c.playout_buffered_ms
+                .store(playout.buffered_ms(), Ordering::Relaxed);
+            c.playout_underruns
+                .store(playout.underruns(), Ordering::Relaxed);
+            c.playout_skipped_ms
+                .store(playout.skipped_ms(), Ordering::Relaxed);
+        }
+        if let Some(capture) = &self.capture {
+            c.capture_overflow_samples
+                .store(capture.overflow_samples(), Ordering::Relaxed);
+        }
     }
 }

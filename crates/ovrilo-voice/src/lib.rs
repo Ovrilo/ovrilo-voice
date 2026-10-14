@@ -10,6 +10,7 @@ mod contract;
 mod dsp;
 mod engine;
 mod mixer;
+mod speaking;
 mod state;
 pub mod transport;
 
@@ -18,7 +19,8 @@ pub use audio::{
     ProcessorFactory,
 };
 pub use contract::{
-    AudioDevice, DeviceId, ParticipantId, VoiceCommand, VoiceError, VoiceErrorCode, VoiceEvent,
+    AudioDevice, DeviceId, NetworkStats, ParticipantId, VoiceCommand, VoiceError, VoiceErrorCode,
+    VoiceEvent, VoiceStats,
 };
 pub use engine::{VoiceEngine, VoiceEngineHandle};
 pub use mixer::Mixer;
