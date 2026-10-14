@@ -12,12 +12,18 @@
 //! voice-spike call --identity alice --source mic             # listening test (use headphones!)
 //! voice-spike call --identity bob --play
 //! ```
+//!
+//! Screen sharing (ADR-0017, spike S0) lives in `screen.rs`: `screen-sources`, `encoders`,
+//! `screen-share` and `screen-watch`.
 
+mod app_audio;
 mod cpal_capture;
 mod cpal_playback;
 mod cpal_probe;
 mod dsp;
 mod echo_delay;
+mod pattern;
+mod screen;
 mod signal;
 
 use std::collections::HashMap;
@@ -99,7 +105,17 @@ async fn main() -> ExitCode {
             Ok(call_args) => call(call_args).await,
             Err(error) => Err(error),
         },
-        _ => Err(USAGE.to_owned()),
+        Some("screen-sources") => screen::list_sources(),
+        Some("encoders") => screen::list_encoders(),
+        Some("screen-share") => match screen::parse_share(&args[1..]) {
+            Ok(share_args) => screen::share(share_args).await,
+            Err(error) => Err(format!("{error}\n{USAGE}\n{}", screen::USAGE)),
+        },
+        Some("screen-watch") => match screen::parse_watch(&args[1..]) {
+            Ok(watch_args) => screen::watch(watch_args).await,
+            Err(error) => Err(format!("{error}\n{USAGE}\n{}", screen::USAGE)),
+        },
+        _ => Err(format!("{USAGE}\n{}", screen::USAGE)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

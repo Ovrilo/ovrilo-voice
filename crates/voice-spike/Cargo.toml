@@ -13,7 +13,12 @@ futures-util = "0.3"
 livekit = { version = "0.9.5", default-features = false, features = ["native", "rustls-tls-native-roots"] }
 livekit-api = { version = "0.9.0", default-features = false, features = ["access-token"] }
 rtrb = "0.3.5"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tokio = { version = "1.53.2", features = ["full"] }
+
+[target.'cfg(windows)'.dependencies]
+# Application audio for screen sharing: WASAPI process loopback (ADR-0017).
+wasapi = "0.26.0"
 
 [lints]
 workspace = true
