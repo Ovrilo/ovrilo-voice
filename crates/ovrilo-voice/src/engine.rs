@@ -9,7 +9,9 @@ use tokio::sync::mpsc;
 
 use crate::ConnectionState;
 use crate::audio::{AudioBackend, ProcessorFactory};
-use crate::contract::{DeviceId, VoiceCommand, VoiceError, VoiceErrorCode, VoiceEvent};
+use crate::contract::{
+    DeviceId, ParticipantId, ScreenShare, VoiceCommand, VoiceError, VoiceErrorCode, VoiceEvent,
+};
 
 /// How often [`VoiceEvent::StatsUpdated`] is emitted while in a room.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
@@ -61,6 +63,7 @@ impl VoiceEngine {
             input: None,
             output: None,
             stats: stats_interval(),
+            screen_share: None,
         };
         tokio::spawn(control.run(command_rx));
         (VoiceEngineHandle { commands }, events)
@@ -85,6 +88,13 @@ struct Control<B: AudioBackend, T: Transport> {
     output: Option<DeviceId>,
     /// Paces [`VoiceEvent::StatsUpdated`]; restarted on every join.
     stats: tokio::time::Interval,
+    /// The local screen share while it runs (ADR-0017).
+    screen_share: Option<ScreenShare>,
+}
+
+/// Mixer key of a participant's screen-share audio, kept apart from their voice.
+fn stream_key(participant: &ParticipantId) -> ParticipantId {
+    ParticipantId(format!("{participant}#screen"))
 }
 
 fn stats_interval() -> tokio::time::Interval {
@@ -194,6 +204,54 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
                     self.open_output();
                 }
             }
+            VoiceCommand::ListScreenSources => match self.transport.screen_sources() {
+                Ok(sources) => self.emit(VoiceEvent::ScreenSourcesListed(sources)),
+                Err(error) => self.emit(error.into()),
+            },
+            VoiceCommand::StartScreenShare {
+                source,
+                preset,
+                audio,
+            } => {
+                let Some(session) = self.session.as_mut() else {
+                    self.emit(
+                        VoiceError::new(VoiceErrorCode::InvalidState, "join a room to share")
+                            .into(),
+                    );
+                    return;
+                };
+                match session.start_screen_share(&source, preset, audio).await {
+                    Ok(share) => {
+                        self.screen_share = Some(share.clone());
+                        self.emit(VoiceEvent::ScreenShareChanged(Some(share)));
+                    }
+                    Err(error) => {
+                        // A failed start leaves nothing running.
+                        self.emit(error.into());
+                        self.end_screen_share();
+                    }
+                }
+            }
+            VoiceCommand::StopScreenShare => {
+                if let Some(session) = self.session.as_mut() {
+                    session.stop_screen_share().await;
+                }
+                self.end_screen_share();
+            }
+            VoiceCommand::WatchScreenShare {
+                participant,
+                watching,
+            } => {
+                if let Some(session) = self.session.as_mut() {
+                    session
+                        .set_screen_audio_subscribed(&participant, watching)
+                        .await;
+                }
+                if !watching {
+                    self.dsp
+                        .send(DspCommand::RemoveRemote(stream_key(&participant)));
+                }
+            }
             VoiceCommand::RefreshDevices => {
                 match (self.backend.input_devices(), self.backend.output_devices()) {
                     (Ok(inputs), Ok(outputs)) => {
@@ -299,7 +357,15 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
         if let Some(session) = self.session.take() {
             session.close().await;
         }
+        self.end_screen_share();
         self.set_state(ConnectionState::Disconnected);
+    }
+
+    /// Reports that the local share is over (once).
+    fn end_screen_share(&mut self) {
+        if self.screen_share.take().is_some() {
+            self.emit(VoiceEvent::ScreenShareChanged(None));
+        }
     }
 
     async fn handle_transport_event(&mut self, event: TransportEvent) {
@@ -315,7 +381,30 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
             }
             TransportEvent::ParticipantLeft { id } => {
                 self.dsp.send(DspCommand::RemoveRemote(id.clone()));
+                self.dsp.send(DspCommand::RemoveRemote(stream_key(&id)));
                 self.emit(VoiceEvent::ParticipantLeft { id });
+            }
+            TransportEvent::ParticipantScreenShare { id, sharing, audio } => {
+                if !sharing {
+                    self.dsp.send(DspCommand::RemoveRemote(stream_key(&id)));
+                }
+                self.emit(VoiceEvent::ParticipantScreenShareChanged {
+                    participant: id,
+                    sharing,
+                    audio,
+                });
+            }
+            TransportEvent::RemoteScreenAudioStarted { id, frames } => self
+                .dsp
+                .send(DspCommand::AddStream(stream_key(&id), frames)),
+            TransportEvent::RemoteScreenAudioEnded { id } => {
+                self.dsp.send(DspCommand::RemoveRemote(stream_key(&id)))
+            }
+            TransportEvent::ScreenShareEnded { reason } => {
+                if self.screen_share.is_some() {
+                    self.emit(VoiceError::capture(reason).into());
+                    self.end_screen_share();
+                }
             }
             TransportEvent::RemoteAudioStarted { id, frames } => {
                 self.dsp.send(DspCommand::AddRemote(id, frames))

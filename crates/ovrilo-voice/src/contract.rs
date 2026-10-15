@@ -29,6 +29,56 @@ impl fmt::Display for ParticipantId {
     }
 }
 
+/// Identifies a screen or window that can be shared, as listed by [`VoiceEvent::ScreenSourcesListed`].
+/// Opaque to hosts; valid until the window closes or the display changes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScreenSourceId(pub String);
+
+impl fmt::Display for ScreenSourceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScreenSourceKind {
+    Screen,
+    Window,
+}
+
+/// Something that can be shared (ADR-0017). Ovrilo's own windows are never listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenSource {
+    pub id: ScreenSourceId,
+    pub kind: ScreenSourceKind,
+    pub title: String,
+    /// Executable of the window's application (for example `chrome.exe`); `None` for screens.
+    pub application: Option<String>,
+    /// The application's sound can be shared with it (windows on Windows 10 2004 or later).
+    pub audio_available: bool,
+}
+
+/// Resolution and frame-rate cap of a screen share. The source is scaled down to fit, never up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SharePreset {
+    #[default]
+    Hd720p30,
+    FullHd1080p30,
+    FullHd1080p60,
+}
+
+/// The local user's screen share while it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenShare {
+    pub source: ScreenSourceId,
+    pub title: String,
+    pub preset: SharePreset,
+    /// The application's sound is shared too.
+    pub audio: bool,
+}
+
 /// Coarse control requests sent by the host to the engine. Never carries audio frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -59,6 +109,23 @@ pub enum VoiceCommand {
     SetParticipantVolume {
         participant: ParticipantId,
         percent: u16,
+    },
+    /// Lists screens and windows that can be shared ([`VoiceEvent::ScreenSourcesListed`]).
+    ListScreenSources,
+    /// Shares a screen or window in the current room, optionally with the window's application
+    /// sound. Replaces a running share.
+    StartScreenShare {
+        source: ScreenSourceId,
+        preset: SharePreset,
+        audio: bool,
+    },
+    /// Stops sharing. Idempotent.
+    StopScreenShare,
+    /// Plays (or stops playing) a participant's screen-share sound. Their video is watched by the
+    /// host itself; the engine never downloads screen-share video.
+    WatchScreenShare {
+        participant: ParticipantId,
+        watching: bool,
     },
 }
 
@@ -107,6 +174,17 @@ pub enum VoiceEvent {
         participant: Option<ParticipantId>,
         speaking: bool,
     },
+    ScreenSourcesListed(Vec<ScreenSource>),
+    /// The local screen share started, changed or stopped (`None`), including when the shared
+    /// window closed or capture failed (an [`VoiceEvent::Error`] says why).
+    ScreenShareChanged(Option<ScreenShare>),
+    /// A remote participant started or stopped sharing their screen (also sent right after joining).
+    ParticipantScreenShareChanged {
+        participant: ParticipantId,
+        sharing: bool,
+        /// Their share includes application sound.
+        audio: bool,
+    },
 }
 
 /// Diagnostics for the current room. Counters are cumulative since joining.
@@ -152,6 +230,8 @@ pub enum VoiceErrorCode {
     PermissionDenied,
     DeviceUnavailable,
     TransportUnavailable,
+    /// Screen sharing failed: unsupported platform, source gone, capture or encoder error.
+    CaptureUnavailable,
     Internal,
 }
 
@@ -176,6 +256,10 @@ impl VoiceError {
 
     pub fn transport(message: impl Into<String>) -> Self {
         Self::new(VoiceErrorCode::TransportUnavailable, message)
+    }
+
+    pub fn capture(message: impl Into<String>) -> Self {
+        Self::new(VoiceErrorCode::CaptureUnavailable, message)
     }
 }
 

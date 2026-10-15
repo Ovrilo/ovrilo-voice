@@ -37,6 +37,9 @@ pub(crate) enum DspCommand {
     SetPlayout(Option<Box<dyn PlayoutStream>>),
     SetMicrophoneSink(Option<mpsc::Sender<Frame>>),
     AddRemote(ParticipantId, mpsc::Receiver<Frame>),
+    /// A watched screen share's audio (ADR-0017): mixed and echo-cancelled like voice, but never
+    /// reported as speaking.
+    AddStream(ParticipantId, mpsc::Receiver<Frame>),
     RemoveRemote(ParticipantId),
     /// Clears devices, remotes and the microphone sink (leaving a room).
     Reset,
@@ -163,8 +166,18 @@ struct DspLoop {
 struct Remote {
     id: ParticipantId,
     frames: mpsc::Receiver<Frame>,
-    speaking: SpeakingDetector,
+    /// `None` for streams (screen-share audio), which are not speech.
+    speaking: Option<SpeakingDetector>,
     volume: u16,
+}
+
+impl Remote {
+    /// Updates speaking detection with a received frame; returns the transition, if any.
+    fn detect_speaking(&mut self, audio: &Frame) -> Option<bool> {
+        self.speaking
+            .as_mut()
+            .and_then(|detector| detector.update(audio))
+    }
 }
 
 impl DspLoop {
@@ -216,16 +229,8 @@ impl DspLoop {
             DspCommand::SetCapture(capture) => self.capture = capture,
             DspCommand::SetPlayout(playout) => self.playout = playout,
             DspCommand::SetMicrophoneSink(sink) => self.microphone = sink,
-            DspCommand::AddRemote(id, frames) => {
-                self.remove_remote(&id);
-                let volume = self.volumes.get(&id).copied().unwrap_or(100);
-                self.remotes.push(Remote {
-                    id,
-                    frames,
-                    speaking: SpeakingDetector::default(),
-                    volume,
-                });
-            }
+            DspCommand::AddRemote(id, frames) => self.add_remote(id, frames, true),
+            DspCommand::AddStream(id, frames) => self.add_remote(id, frames, false),
             DspCommand::RemoveRemote(id) => self.remove_remote(&id),
             DspCommand::Reset => {
                 self.capture = None;
@@ -296,8 +301,19 @@ impl DspLoop {
         }
     }
 
+    fn add_remote(&mut self, id: ParticipantId, frames: mpsc::Receiver<Frame>, speech: bool) {
+        self.remove_remote(&id);
+        let volume = self.volumes.get(&id).copied().unwrap_or(100);
+        self.remotes.push(Remote {
+            id,
+            frames,
+            speaking: speech.then(SpeakingDetector::default),
+            volume,
+        });
+    }
+
     fn end_remote(&self, mut remote: Remote) {
-        let change = remote.speaking.silence();
+        let change = remote.speaking.as_mut().and_then(SpeakingDetector::silence);
         self.emit_speaking(Some(remote.id), change);
     }
 
@@ -328,7 +344,7 @@ impl DspLoop {
             for remote in &mut self.remotes {
                 while let Ok(audio) = remote.frames.try_recv() {
                     drained = true;
-                    if let Some(speaking) = remote.speaking.update(&audio) {
+                    if let Some(speaking) = remote.detect_speaking(&audio) {
                         let _ = self.events.send(VoiceEvent::SpeakingChanged {
                             participant: Some(remote.id.clone()),
                             speaking,
@@ -344,7 +360,7 @@ impl DspLoop {
 
         for remote in &mut self.remotes {
             if let Ok(audio) = remote.frames.try_recv() {
-                if let Some(speaking) = remote.speaking.update(&audio) {
+                if let Some(speaking) = remote.detect_speaking(&audio) {
                     let _ = self.events.send(VoiceEvent::SpeakingChanged {
                         participant: Some(remote.id.clone()),
                         speaking,
