@@ -8,8 +8,9 @@ use ovrilo_voice::audio::FRAME_SAMPLES;
 use ovrilo_voice::{
     AudioBackend, AudioDevice, CaptureStream, Connected, ConnectionState, DeviceId, Frame,
     NetworkStats, NoProcessing, ParticipantId, PlayoutStream, ScreenShare, ScreenSource,
-    ScreenSourceId, ScreenSourceKind, SharePreset, Transport, TransportEvent, TransportSession,
-    VoiceCommand, VoiceEngine, VoiceEngineHandle, VoiceError, VoiceErrorCode, VoiceEvent,
+    ScreenSourceId, ScreenSourceKind, ShareOptimization, SharePreset, Transport, TransportEvent,
+    TransportSession, VoiceCommand, VoiceEngine, VoiceEngineHandle, VoiceError, VoiceErrorCode,
+    VoiceEvent,
 };
 use tokio::sync::mpsc;
 
@@ -175,6 +176,7 @@ impl TransportSession for FakeSession {
         &mut self,
         source: &ScreenSourceId,
         preset: SharePreset,
+        optimization: ShareOptimization,
         audio: bool,
     ) -> Result<ScreenShare, VoiceError> {
         if *source != window_source().id {
@@ -185,6 +187,7 @@ impl TransportSession for FakeSession {
             source: source.clone(),
             title: "Game".into(),
             preset,
+            optimization,
             audio,
         })
     }
@@ -774,6 +777,7 @@ fn game_share(audio: bool) -> ScreenShare {
         source: window_source().id,
         title: "Game".into(),
         preset: SharePreset::FullHd1080p30,
+        optimization: ShareOptimization::Motion,
         audio,
     }
 }
@@ -782,6 +786,7 @@ fn start_game_share(h: &Harness) {
     h.send(VoiceCommand::StartScreenShare {
         source: window_source().id,
         preset: SharePreset::FullHd1080p30,
+        optimization: ShareOptimization::Motion,
         audio: true,
     });
 }
@@ -836,6 +841,7 @@ async fn failed_and_lost_screen_shares_are_reported() {
     h.send(VoiceCommand::StartScreenShare {
         source: ScreenSourceId("window:404".into()),
         preset: SharePreset::Hd720p30,
+        optimization: ShareOptimization::Detail,
         audio: false,
     });
     h.expect_error(VoiceErrorCode::CaptureUnavailable).await;

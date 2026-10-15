@@ -8,7 +8,8 @@ use tokio::sync::mpsc;
 
 use crate::audio::Frame;
 use crate::contract::{
-    NetworkStats, ParticipantId, ScreenShare, ScreenSource, ScreenSourceId, SharePreset, VoiceError,
+    NetworkStats, ParticipantId, ScreenShare, ScreenSource, ScreenSourceId, ShareOptimization,
+    SharePreset, VoiceError,
 };
 
 /// Connects to rooms. One transport can create many sessions over the engine's lifetime.
@@ -53,9 +54,10 @@ pub trait TransportSession: Send + 'static {
         &mut self,
         source: &ScreenSourceId,
         preset: SharePreset,
+        optimization: ShareOptimization,
         audio: bool,
     ) -> impl Future<Output = Result<ScreenShare, VoiceError>> + Send {
-        let _ = (source, preset, audio);
+        let _ = (source, preset, optimization, audio);
         std::future::ready(Err(VoiceError::capture(
             "screen sharing is not supported by this transport",
         )))

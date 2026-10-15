@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use livekit::options::{VideoCodec, VideoEncoding};
+use livekit::options::{DegradationPreference, VideoCodec, VideoEncoding};
 use livekit::webrtc::desktop_capturer::{
     CaptureError, CaptureSource, DesktopCaptureSourceType, DesktopCapturer, DesktopCapturerOptions,
     DesktopFrame,
@@ -16,7 +16,8 @@ use livekit::webrtc::native::yuv_helper;
 use livekit::webrtc::prelude::{I420Buffer, VideoFrame, VideoResolution, VideoRotation};
 use livekit::webrtc::video_source::native::NativeVideoSource;
 use ovrilo_voice::{
-    ScreenSource, ScreenSourceId, ScreenSourceKind, SharePreset, TransportEvent, VoiceError,
+    ScreenSource, ScreenSourceId, ScreenSourceKind, ShareOptimization, SharePreset, TransportEvent,
+    VoiceError,
 };
 use tokio::sync::mpsc;
 
@@ -25,36 +26,52 @@ use crate::app_audio;
 /// Consecutive permanent capture errors after which the share ends (the window closed).
 const PERMANENT_ERRORS_TO_END: u32 = 5;
 
-/// Encoding limits of a preset. Bitrate caps follow LiveKit's screen-share presets.
+/// How a share is encoded: size and frame-rate caps from the preset, codec and degradation from
+/// the optimization.
+///
+/// This SDK has no hardware video encoder on Windows (NVENC is Linux-only), so codecs are picked
+/// from software encoders measured on the same 1080p30 content (4-core Linux VM, local SFU,
+/// not an authoritative baseline): on scrolling code AV1 needed ~600 kbps against ~1.3 Mbps for
+/// VP9 at similar CPU, while OpenH264 looked worst; on fast motion only VP8 kept 30 fps (H.264
+/// 10, VP9 13, AV1 18 fps, all CPU-limited).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Encoding {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
     pub max_bitrate: u64,
+    pub codec: VideoCodec,
+    pub degradation: DegradationPreference,
 }
 
 impl Encoding {
-    pub fn of(preset: SharePreset) -> Self {
-        match preset {
-            SharePreset::FullHd1080p30 => Self {
-                width: 1920,
-                height: 1080,
-                fps: 30,
-                max_bitrate: 4_000_000,
-            },
-            SharePreset::FullHd1080p60 => Self {
-                width: 1920,
-                height: 1080,
-                fps: 60,
-                max_bitrate: 6_000_000,
-            },
-            _ => Self {
-                width: 1280,
-                height: 720,
-                fps: 30,
-                max_bitrate: 2_000_000,
-            },
+    pub fn of(preset: SharePreset, optimization: ShareOptimization) -> Self {
+        // Upper bounds per viewer for VP8; the encoder uses less when the picture allows.
+        let (width, height, fps, max_bitrate) = match preset {
+            SharePreset::FullHd1080p30 => (1920, 1080, 30, 6_000_000),
+            SharePreset::FullHd1080p60 => (1920, 1080, 60, 9_000_000),
+            _ => (1280, 720, 30, 3_000_000),
+        };
+        let (codec, degradation, max_bitrate) = match optimization {
+            ShareOptimization::Motion => (
+                VideoCodec::VP8,
+                DegradationPreference::MaintainFramerate,
+                max_bitrate,
+            ),
+            // AV1 needs about 30 % fewer bits for the same picture (LiveKit applies the same factor).
+            _ => (
+                VideoCodec::AV1,
+                DegradationPreference::MaintainResolution,
+                max_bitrate * 7 / 10,
+            ),
+        };
+        Self {
+            width,
+            height,
+            fps,
+            max_bitrate,
+            codec,
+            degradation,
         }
     }
 
@@ -84,9 +101,6 @@ impl Encoding {
         )
     }
 }
-
-/// H.264 lets WebRTC pick a hardware encoder where one exists (software OpenH264 otherwise).
-pub(crate) const CODEC: VideoCodec = VideoCodec::H264;
 
 /// A parsed [`ScreenSourceId`]: `screen:<id>` or `window:<id>` (WebRTC source ids).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,12 +358,27 @@ mod tests {
 
     #[test]
     fn presets_fit_without_upscaling_and_keep_even_sizes() {
-        let hd = Encoding::of(SharePreset::Hd720p30);
+        let hd = Encoding::of(SharePreset::Hd720p30, ShareOptimization::Detail);
         assert_eq!(hd.fit(2560, 1440), (1280, 720));
         assert_eq!(hd.fit(3440, 1440), (1280, 534));
         assert_eq!(hd.fit(1001, 601), (1000, 600), "never upscaled, even");
-        let full = Encoding::of(SharePreset::FullHd1080p60);
-        assert_eq!((full.fps, full.max_bitrate), (60, 6_000_000));
+        let full = Encoding::of(SharePreset::FullHd1080p60, ShareOptimization::Motion);
+        assert_eq!((full.fps, full.max_bitrate), (60, 9_000_000));
+    }
+
+    #[test]
+    fn optimization_picks_codec_and_what_gives_way() {
+        let detail = Encoding::of(SharePreset::FullHd1080p30, ShareOptimization::Detail);
+        assert_eq!(detail.codec, VideoCodec::AV1);
+        assert_eq!(
+            detail.degradation,
+            DegradationPreference::MaintainResolution
+        );
+        assert_eq!(detail.max_bitrate, 4_200_000);
+        let motion = Encoding::of(SharePreset::FullHd1080p30, ShareOptimization::Motion);
+        assert_eq!(motion.codec, VideoCodec::VP8);
+        assert_eq!(motion.degradation, DegradationPreference::MaintainFramerate);
+        assert_eq!(motion.max_bitrate, 6_000_000);
     }
 
     #[test]

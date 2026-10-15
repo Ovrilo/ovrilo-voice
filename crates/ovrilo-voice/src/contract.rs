@@ -69,12 +69,25 @@ pub enum SharePreset {
     FullHd1080p60,
 }
 
+/// What a screen share keeps when the network or the computer cannot keep up, and the codec
+/// chosen for that kind of picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ShareOptimization {
+    /// Text, code and applications: stays sharp and lowers the frame rate first.
+    #[default]
+    Detail,
+    /// Games and video: stays smooth and lowers the resolution first.
+    Motion,
+}
+
 /// The local user's screen share while it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenShare {
     pub source: ScreenSourceId,
     pub title: String,
     pub preset: SharePreset,
+    pub optimization: ShareOptimization,
     /// The application's sound is shared too.
     pub audio: bool,
 }
@@ -117,6 +130,7 @@ pub enum VoiceCommand {
     StartScreenShare {
         source: ScreenSourceId,
         preset: SharePreset,
+        optimization: ShareOptimization,
         audio: bool,
     },
     /// Stops sharing. Idempotent.

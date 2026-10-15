@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! cargo run -p ovrilo-voice-livekit --example screen_share_check --release -- --list
-//! cargo run -p ovrilo-voice-livekit --example screen_share_check --release -- --source window:<id> --audio --seconds 20
+//! cargo run -p ovrilo-voice-livekit --example screen_share_check --release -- --source window:<id> --audio [--motion] --seconds 20
 //! ```
 
 use std::sync::Arc;
@@ -18,7 +18,8 @@ use livekit::prelude::*;
 use livekit::webrtc::video_stream::native::NativeVideoStream;
 use livekit_api::access_token::{AccessToken, VideoGrants};
 use ovrilo_voice::{
-    ParticipantId, ScreenSourceId, SharePreset, Transport, TransportEvent, TransportSession,
+    ParticipantId, ScreenSourceId, ShareOptimization, SharePreset, Transport, TransportEvent,
+    TransportSession,
 };
 use ovrilo_voice_livekit::LiveKitTransport;
 use tokio::sync::mpsc;
@@ -92,6 +93,11 @@ async fn main() -> Result<(), String> {
         .map(ScreenSourceId)
         .unwrap_or_else(|| sources[0].id.clone());
     let audio = args.iter().any(|a| a == "--audio");
+    let optimization = if args.iter().any(|a| a == "--motion") {
+        ShareOptimization::Motion
+    } else {
+        ShareOptimization::Detail
+    };
     let seconds: u64 = value("--seconds")
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
@@ -146,7 +152,7 @@ async fn main() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let mut session = sharer.session;
     let share = session
-        .start_screen_share(&source, SharePreset::Hd720p30, audio)
+        .start_screen_share(&source, SharePreset::Hd720p30, optimization, audio)
         .await
         .map_err(|e| e.to_string())?;
     println!("sharing {:?}", share);

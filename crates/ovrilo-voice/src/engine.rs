@@ -211,6 +211,7 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
             VoiceCommand::StartScreenShare {
                 source,
                 preset,
+                optimization,
                 audio,
             } => {
                 let Some(session) = self.session.as_mut() else {
@@ -220,7 +221,10 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
                     );
                     return;
                 };
-                match session.start_screen_share(&source, preset, audio).await {
+                match session
+                    .start_screen_share(&source, preset, optimization, audio)
+                    .await
+                {
                     Ok(share) => {
                         self.screen_share = Some(share.clone());
                         self.emit(VoiceEvent::ScreenShareChanged(Some(share)));

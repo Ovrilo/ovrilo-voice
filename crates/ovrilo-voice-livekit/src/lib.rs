@@ -27,8 +27,8 @@ use livekit::webrtc::video_source::native::NativeVideoSource;
 use ovrilo_voice::audio::{FRAME_SAMPLES, SAMPLE_RATE};
 use ovrilo_voice::{
     AudioProcessor, Connected, Frame, NetworkStats, ParticipantId, ProcessorFactory, ScreenShare,
-    ScreenSource, ScreenSourceId, SharePreset, Transport, TransportEvent, TransportSession,
-    VoiceError,
+    ScreenSource, ScreenSourceId, ShareOptimization, SharePreset, Transport, TransportEvent,
+    TransportSession, VoiceError,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -157,10 +157,11 @@ impl LiveKitSession {
         &mut self,
         source: &ScreenSourceId,
         preset: SharePreset,
+        optimization: ShareOptimization,
         audio: bool,
     ) -> Result<ScreenShare, VoiceError> {
         let target = screen::Target::parse(source)?;
-        let encoding = screen::Encoding::of(preset);
+        let encoding = screen::Encoding::of(preset, optimization);
         let video_source = NativeVideoSource::new(encoding.resolution(), true);
         let capture = screen::start(target, encoding, video_source.clone(), self.events.clone())?;
         let title = capture.title.clone();
@@ -173,8 +174,9 @@ impl LiveKitSession {
                 LocalTrack::Video(track),
                 TrackPublishOptions {
                     source: TrackSource::Screenshare,
-                    video_codec: screen::CODEC,
+                    video_codec: encoding.codec,
                     video_encoding: Some(encoding.video_encoding()),
+                    degradation_preference: Some(encoding.degradation),
                     simulcast: false,
                     ..Default::default()
                 },
@@ -199,6 +201,7 @@ impl LiveKitSession {
             source: source.clone(),
             title,
             preset,
+            optimization,
             audio: shared_audio,
         })
     }
@@ -296,10 +299,13 @@ impl TransportSession for LiveKitSession {
         &mut self,
         source: &ScreenSourceId,
         preset: SharePreset,
+        optimization: ShareOptimization,
         audio: bool,
     ) -> Result<ScreenShare, VoiceError> {
         self.unpublish_share().await;
-        let result = self.publish_share(source, preset, audio).await;
+        let result = self
+            .publish_share(source, preset, optimization, audio)
+            .await;
         if result.is_err() {
             self.unpublish_share().await;
         }

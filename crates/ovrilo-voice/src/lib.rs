@@ -20,8 +20,8 @@ pub use audio::{
 };
 pub use contract::{
     AudioDevice, DeviceId, NetworkStats, ParticipantId, ScreenShare, ScreenSource, ScreenSourceId,
-    ScreenSourceKind, SharePreset, VoiceCommand, VoiceError, VoiceErrorCode, VoiceEvent,
-    VoiceStats,
+    ScreenSourceKind, ShareOptimization, SharePreset, VoiceCommand, VoiceError, VoiceErrorCode,
+    VoiceEvent, VoiceStats,
 };
 pub use engine::{VoiceEngine, VoiceEngineHandle};
 pub use mixer::Mixer;

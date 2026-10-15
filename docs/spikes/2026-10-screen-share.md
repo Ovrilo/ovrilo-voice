@@ -36,6 +36,22 @@ Findings:
 - The pattern bitrate is not representative (it compresses far better than a game); compare bitrates only on real windows.
 - Linux build notes: the prebuilt libwebrtc needs clang ≥ 21 (`CC`/`CXX`), and its desktop-capture code needs GLib/GIO at link time (`cargo rustc -p voice-spike --release -- -l gio-2.0 -l gobject-2.0 -l glib-2.0`). Not relevant on Windows.
 
+### Codec choice on real screen content (2026-10-15)
+
+First Windows feedback: 720p over H.264 looked bad and 1080p60 did not open. `webrtc-sys` 0.3.49 compiles NVENC only on Linux (it needs CUDA headers and `dlopen`) and has no Windows hardware encoder at all, so on Windows every codec is a software encoder. Same container as above, Xvfb 1920×1080 captured with `screen:<id>` while Chromium rendered the page (which itself used about one core), 1080p30, 4 Mbps cap, one viewer, 30 s per run:
+
+| Content | Codec | Sent | Encode ms/frame | Sharer CPU | Notes |
+|---|---|---|---|---|---|
+| Scrolling code (static between steps) | OpenH264 | 30 fps, ~100 kbps | 13 | ~50 % of one core | very low bitrate for text, jitter buffer ~320 ms |
+| | VP9 | 30 fps, ~1.3 Mbps | 11 | ~66 % | |
+| | **AV1** (libaom) | 30 fps, **~600 kbps** | 9 | ~52 % | |
+| Full-screen motion (canvas animation) | OpenH264 | **10 fps**, 3.7 Mbps | 64 | ~75 % | limited by CPU |
+| | VP9 | **13 fps**, 2.5 Mbps | 39 | ~104 % | limited by CPU |
+| | AV1 | **18 fps**, 3.6 Mbps | 56 | ~183 % | limited by CPU |
+| | **VP8** | **30 fps**, 4.0 Mbps (at cap) | 17 | ~109 % | |
+
+Decision (engine `ShareOptimization`): **Detail** (text, code, apps) publishes AV1 with `MaintainResolution`; **Motion** (games, video) publishes VP8 with `MaintainFramerate`. Caps: 720p30 3 Mbps, 1080p30 6 Mbps, 1080p60 9 Mbps for VP8, AV1 at 70 % of that. Chromium decodes both (checked in the desktop UI in a browser: AV1 1920×1080 ~29 fps, VP8 1920×1080 30 fps). Open: CPU cost and game FPS on the reference Windows PC, AV1 decoding in WebView2 on the testers' machines, and revisiting hardware H.264 once the SDK offers it on Windows.
+
 ## Measurement protocol (Windows, reference PC)
 
 Prerequisites: `ovrilo-infra/local` running (`docker compose up -d --wait`), a release build of the spike (`cargo build -p voice-spike --release`), and a game with an in-game FPS counter. Run each line in its own terminal from `ovrilo-voice`.
