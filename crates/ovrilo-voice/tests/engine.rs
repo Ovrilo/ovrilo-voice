@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use ovrilo_voice::audio::FRAME_SAMPLES;
 use ovrilo_voice::{
     AudioBackend, AudioDevice, CaptureStream, Connected, ConnectionState, DeviceId, Frame,
-    NetworkStats, NoProcessing, ParticipantId, PlayoutStream, Transport, TransportEvent,
+    NetworkStats, NoProcessing, ParticipantId, PlayoutStream, ScreenShare, ScreenSource,
+    ScreenSourceId, ScreenSourceKind, ShareOptimization, SharePreset, Transport, TransportEvent,
     TransportSession, VoiceCommand, VoiceEngine, VoiceEngineHandle, VoiceError, VoiceErrorCode,
     VoiceEvent,
 };
@@ -102,6 +103,20 @@ struct Room {
     microphone: Option<mpsc::Receiver<Frame>>,
     mute_calls: Vec<bool>,
     closed: bool,
+    /// Source of the running fake screen share.
+    sharing: Option<ScreenSourceId>,
+    /// Participants whose screen audio is subscribed.
+    screen_audio: Vec<ParticipantId>,
+}
+
+fn window_source() -> ScreenSource {
+    ScreenSource {
+        id: ScreenSourceId("window:7".into()),
+        kind: ScreenSourceKind::Window,
+        title: "Game".into(),
+        application: Some("game.exe".into()),
+        audio_available: true,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -135,6 +150,10 @@ impl Transport for FakeTransport {
             microphone,
         })
     }
+
+    fn screen_sources(&self) -> Result<Vec<ScreenSource>, VoiceError> {
+        Ok(vec![window_source()])
+    }
 }
 
 impl TransportSession for FakeSession {
@@ -151,6 +170,38 @@ impl TransportSession for FakeSession {
         stats.round_trip_ms = Some(42);
         stats.inbound_concealed_ms = 30;
         stats
+    }
+
+    async fn start_screen_share(
+        &mut self,
+        source: &ScreenSourceId,
+        preset: SharePreset,
+        optimization: ShareOptimization,
+        audio: bool,
+    ) -> Result<ScreenShare, VoiceError> {
+        if *source != window_source().id {
+            return Err(VoiceError::capture("source not found"));
+        }
+        self.0.lock().unwrap().sharing = Some(source.clone());
+        Ok(ScreenShare {
+            source: source.clone(),
+            title: "Game".into(),
+            preset,
+            optimization,
+            audio,
+        })
+    }
+
+    async fn stop_screen_share(&mut self) {
+        self.0.lock().unwrap().sharing = None;
+    }
+
+    async fn set_screen_audio_subscribed(&mut self, participant: &ParticipantId, subscribed: bool) {
+        let mut room = self.0.lock().unwrap();
+        room.screen_audio.retain(|p| p != participant);
+        if subscribed {
+            room.screen_audio.push(participant.clone());
+        }
     }
 }
 
@@ -716,5 +767,158 @@ async fn remote_microphone_mute_is_forwarded() {
         participant: ParticipantId("a".into()),
         muted: true,
     }])
+    .await;
+}
+
+// ---------- screen sharing (ADR-0017) ----------
+
+fn game_share(audio: bool) -> ScreenShare {
+    ScreenShare {
+        source: window_source().id,
+        title: "Game".into(),
+        preset: SharePreset::FullHd1080p30,
+        optimization: ShareOptimization::Motion,
+        audio,
+    }
+}
+
+fn start_game_share(h: &Harness) {
+    h.send(VoiceCommand::StartScreenShare {
+        source: window_source().id,
+        preset: SharePreset::FullHd1080p30,
+        optimization: ShareOptimization::Motion,
+        audio: true,
+    });
+}
+
+#[tokio::test]
+async fn screen_sources_are_listed_and_sharing_needs_a_room() {
+    let mut h = start(Devices::default(), FakeTransport::default());
+
+    h.send(VoiceCommand::ListScreenSources);
+    h.expect(&[VoiceEvent::ScreenSourcesListed(vec![window_source()])])
+        .await;
+
+    start_game_share(&h);
+    h.expect_error(VoiceErrorCode::InvalidState).await;
+}
+
+#[tokio::test]
+async fn screen_share_starts_stops_and_ends_with_the_room() {
+    let mut h = start(Devices::default(), FakeTransport::default());
+    h.join().await;
+
+    start_game_share(&h);
+    h.expect(&[VoiceEvent::ScreenShareChanged(Some(game_share(true)))])
+        .await;
+    assert_eq!(
+        h.transport.room.lock().unwrap().sharing,
+        Some(window_source().id)
+    );
+
+    h.send(VoiceCommand::StopScreenShare);
+    h.expect(&[VoiceEvent::ScreenShareChanged(None)]).await;
+    assert_eq!(h.transport.room.lock().unwrap().sharing, None);
+
+    // Stopping again reports nothing; leaving while sharing ends the share first.
+    h.send(VoiceCommand::StopScreenShare);
+    start_game_share(&h);
+    h.expect(&[VoiceEvent::ScreenShareChanged(Some(game_share(true)))])
+        .await;
+    h.send(VoiceCommand::Leave);
+    h.expect(&[
+        VoiceEvent::ScreenShareChanged(None),
+        VoiceEvent::ConnectionStateChanged(ConnectionState::Disconnected),
+    ])
+    .await;
+}
+
+#[tokio::test]
+async fn failed_and_lost_screen_shares_are_reported() {
+    let mut h = start(Devices::default(), FakeTransport::default());
+    h.join().await;
+
+    h.send(VoiceCommand::StartScreenShare {
+        source: ScreenSourceId("window:404".into()),
+        preset: SharePreset::Hd720p30,
+        optimization: ShareOptimization::Detail,
+        audio: false,
+    });
+    h.expect_error(VoiceErrorCode::CaptureUnavailable).await;
+
+    start_game_share(&h);
+    h.expect(&[VoiceEvent::ScreenShareChanged(Some(game_share(true)))])
+        .await;
+    h.room_event(TransportEvent::ScreenShareEnded {
+        reason: "the shared window was closed".into(),
+    });
+    h.expect_error(VoiceErrorCode::CaptureUnavailable).await;
+    h.expect(&[VoiceEvent::ScreenShareChanged(None)]).await;
+}
+
+#[tokio::test]
+async fn watched_screen_audio_is_played_but_never_counts_as_speaking() {
+    let mut h = start(Devices::default(), FakeTransport::default());
+    h.join().await;
+    let ada = ParticipantId("a".into());
+
+    h.room_event(TransportEvent::ParticipantScreenShare {
+        id: ada.clone(),
+        sharing: true,
+        audio: true,
+    });
+    h.expect(&[VoiceEvent::ParticipantScreenShareChanged {
+        participant: ada.clone(),
+        sharing: true,
+        audio: true,
+    }])
+    .await;
+
+    h.send(VoiceCommand::WatchScreenShare {
+        participant: ada.clone(),
+        watching: true,
+    });
+    h.wait_until("screen audio is subscribed", |h| {
+        h.transport.room.lock().unwrap().screen_audio == [ParticipantId("a".into())]
+    })
+    .await;
+
+    let (stream_tx, stream_rx) = mpsc::channel(20);
+    h.room_event(TransportEvent::RemoteScreenAudioStarted {
+        id: ada.clone(),
+        frames: stream_rx,
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..30 {
+        stream_tx.send([3000; FRAME_SAMPLES]).await.unwrap();
+    }
+    h.wait_until("the screen audio is played", |h| {
+        h.devices
+            .played
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.iter().all(|&s| s == 3000))
+    })
+    .await;
+
+    // Loud stream audio is not speech: no speaking indicator.
+    let quiet = tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            if let Some(VoiceEvent::SpeakingChanged { .. }) = h.events.recv().await {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "screen audio was reported as speaking");
+
+    h.send(VoiceCommand::WatchScreenShare {
+        participant: ada,
+        watching: false,
+    });
+    h.wait_until("screen audio is dropped", |h| {
+        h.transport.room.lock().unwrap().screen_audio.is_empty()
+    })
     .await;
 }

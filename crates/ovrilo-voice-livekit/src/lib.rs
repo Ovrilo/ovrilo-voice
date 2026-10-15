@@ -3,22 +3,32 @@
 //! Audio crosses the boundary as 48 kHz mono 10 ms frames. The microphone is published from a
 //! `NativeAudioSource` fed by the engine; remote tracks are read with `NativeAudioStream`. WebRTC's
 //! platform audio device module is not used (see ADR-0016).
+//!
+//! Subscriptions are explicit: remote microphones always, a screen share's audio only while the
+//! user watches it, and screen-share video never (the desktop's webview watches video, ADR-0017).
+
+mod app_audio;
+mod screen;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
-use livekit::options::TrackPublishOptions;
+use livekit::options::{AudioEncoding, TrackPublishOptions};
 use livekit::prelude::*;
 use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
 use livekit::webrtc::native::apm::AudioProcessingModule;
+use livekit::webrtc::prelude::RtcVideoSource;
 use livekit::webrtc::stats::{IceCandidatePairState, RtcStats};
+use livekit::webrtc::video_source::native::NativeVideoSource;
 use ovrilo_voice::audio::{FRAME_SAMPLES, SAMPLE_RATE};
 use ovrilo_voice::{
-    AudioProcessor, Connected, Frame, NetworkStats, ParticipantId, ProcessorFactory, Transport,
-    TransportEvent, TransportSession, VoiceError,
+    AudioProcessor, Connected, Frame, NetworkStats, ParticipantId, ProcessorFactory, ScreenShare,
+    ScreenSource, ScreenSourceId, ShareOptimization, SharePreset, Transport, TransportEvent,
+    TransportSession, VoiceError,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -35,6 +45,20 @@ pub struct LiveKitSession {
     room: Room,
     microphone: LocalTrackPublication,
     tasks: Vec<JoinHandle<()>>,
+    events: mpsc::UnboundedSender<TransportEvent>,
+    /// Identities whose screen-share audio the user watches (kept for shares published later).
+    watched: Arc<Mutex<HashSet<String>>>,
+    share: Option<LocalShare>,
+}
+
+/// The local screen share: published tracks plus the capture threads feeding them.
+struct LocalShare {
+    video: LocalTrackPublication,
+    audio: Option<LocalTrackPublication>,
+    // Dropped (stopped) before the tracks are unpublished.
+    capture: Option<screen::Capture>,
+    app_audio: Option<app_audio::AppAudio>,
+    sender: Option<JoinHandle<()>>,
 }
 
 impl Transport for LiveKitTransport {
@@ -45,7 +69,9 @@ impl Transport for LiveKitTransport {
         server_url: &str,
         token: &str,
     ) -> Result<Connected<LiveKitSession>, VoiceError> {
-        let (room, room_events) = Room::connect(server_url, token, RoomOptions::default())
+        let mut options = RoomOptions::default();
+        options.auto_subscribe = false;
+        let (room, room_events) = Room::connect(server_url, token, options)
             .await
             .map_err(|e| VoiceError::transport(format!("connect: {e}")))?;
 
@@ -83,21 +109,165 @@ impl Transport for LiveKitTransport {
         for participant in room.remote_participants().values() {
             let _ = event_tx.send(joined(participant));
             let _ = event_tx.send(microphone_muted(participant));
+            for publication in participant.track_publications().values() {
+                if publication.source() == TrackSource::Microphone {
+                    publication.set_subscribed(true);
+                }
+            }
+            let (sharing, audio) = screen_share_state(participant, None);
+            if sharing {
+                let _ = event_tx.send(TransportEvent::ParticipantScreenShare {
+                    id: ParticipantId(participant.identity().to_string()),
+                    sharing,
+                    audio,
+                });
+            }
         }
 
+        let watched = Arc::new(Mutex::new(HashSet::new()));
         let tasks = vec![
             tokio::spawn(send_microphone(source, microphone_rx)),
-            tokio::spawn(forward_room_events(room_events, event_tx)),
+            tokio::spawn(forward_room_events(
+                room_events,
+                event_tx.clone(),
+                watched.clone(),
+            )),
         ];
         Ok(Connected {
             session: LiveKitSession {
                 room,
                 microphone: microphone_publication,
                 tasks,
+                events: event_tx,
+                watched,
+                share: None,
             },
             events,
             microphone,
         })
+    }
+
+    fn screen_sources(&self) -> Result<Vec<ScreenSource>, VoiceError> {
+        screen::list_sources()
+    }
+}
+
+impl LiveKitSession {
+    async fn publish_share(
+        &mut self,
+        source: &ScreenSourceId,
+        preset: SharePreset,
+        optimization: ShareOptimization,
+        audio: bool,
+    ) -> Result<ScreenShare, VoiceError> {
+        let target = screen::Target::parse(source)?;
+        let encoding = screen::Encoding::of(preset, optimization);
+        let video_source = NativeVideoSource::new(encoding.resolution(), true);
+        let capture = screen::start(target, encoding, video_source.clone(), self.events.clone())?;
+        let title = capture.title.clone();
+        let track =
+            LocalVideoTrack::create_video_track("screen", RtcVideoSource::Native(video_source));
+        let video = self
+            .room
+            .local_participant()
+            .publish_track(
+                LocalTrack::Video(track),
+                TrackPublishOptions {
+                    source: TrackSource::Screenshare,
+                    video_codec: encoding.codec,
+                    video_encoding: Some(encoding.video_encoding()),
+                    degradation_preference: Some(encoding.degradation),
+                    simulcast: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| VoiceError::capture(format!("publish screen: {e}")))?;
+        let mut share = LocalShare {
+            video,
+            audio: None,
+            capture: Some(capture),
+            app_audio: None,
+            sender: None,
+        };
+
+        // Sound is best effort: the share goes on without it (reported as `audio: false`).
+        if audio && let screen::Target::Window(window) = target {
+            let _ = self.publish_app_audio(window, &mut share).await;
+        }
+        let shared_audio = share.audio.is_some();
+        self.share = Some(share);
+        Ok(ScreenShare {
+            source: source.clone(),
+            title,
+            preset,
+            optimization,
+            audio: shared_audio,
+        })
+    }
+
+    async fn publish_app_audio(
+        &mut self,
+        window: u64,
+        share: &mut LocalShare,
+    ) -> Result<(), VoiceError> {
+        let process = app_audio::window_processes()
+            .remove(&window)
+            .ok_or_else(|| VoiceError::capture("the shared window's application was not found"))?;
+        let (capture, frames) = app_audio::start(process.id)?;
+        let source = NativeAudioSource::new(
+            // Stream sound is not speech: no echo cancellation, noise suppression or gain control.
+            AudioSourceOptions {
+                echo_cancellation: false,
+                noise_suppression: false,
+                auto_gain_control: false,
+            },
+            app_audio::SAMPLE_RATE,
+            app_audio::CHANNELS,
+            100,
+        );
+        let track = LocalAudioTrack::create_audio_track(
+            "screen-audio",
+            RtcAudioSource::Native(source.clone()),
+        );
+        let publication = self
+            .room
+            .local_participant()
+            .publish_track(
+                LocalTrack::Audio(track),
+                TrackPublishOptions {
+                    source: TrackSource::ScreenshareAudio,
+                    dtx: false,
+                    red: false,
+                    audio_encoding: Some(AudioEncoding {
+                        max_bitrate: 128_000,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| VoiceError::capture(format!("publish screen audio: {e}")))?;
+        share.audio = Some(publication);
+        share.app_audio = Some(capture);
+        share.sender = Some(tokio::spawn(send_app_audio(source, frames)));
+        Ok(())
+    }
+
+    async fn unpublish_share(&mut self) {
+        let Some(mut share) = self.share.take() else {
+            return;
+        };
+        // Stop feeding the tracks first, then remove them from the room.
+        share.capture = None;
+        share.app_audio = None;
+        if let Some(sender) = share.sender.take() {
+            sender.abort();
+        }
+        let participant = self.room.local_participant();
+        if let Some(audio) = share.audio.take() {
+            let _ = participant.unpublish_track(&audio.sid()).await;
+        }
+        let _ = participant.unpublish_track(&share.video.sid()).await;
     }
 }
 
@@ -110,7 +280,8 @@ impl TransportSession for LiveKitSession {
         }
     }
 
-    async fn close(self) {
+    async fn close(mut self) {
+        self.unpublish_share().await;
         for task in &self.tasks {
             task.abort();
         }
@@ -121,6 +292,92 @@ impl TransportSession for LiveKitSession {
         match self.room.get_stats().await {
             Ok(session) => network_stats(&session.publisher_stats, &session.subscriber_stats),
             Err(_) => NetworkStats::default(),
+        }
+    }
+
+    async fn start_screen_share(
+        &mut self,
+        source: &ScreenSourceId,
+        preset: SharePreset,
+        optimization: ShareOptimization,
+        audio: bool,
+    ) -> Result<ScreenShare, VoiceError> {
+        self.unpublish_share().await;
+        let result = self
+            .publish_share(source, preset, optimization, audio)
+            .await;
+        if result.is_err() {
+            self.unpublish_share().await;
+        }
+        result
+    }
+
+    async fn stop_screen_share(&mut self) {
+        self.unpublish_share().await;
+    }
+
+    async fn set_screen_audio_subscribed(&mut self, participant: &ParticipantId, subscribed: bool) {
+        {
+            let mut watched = self.watched.lock().expect("watched");
+            if subscribed {
+                watched.insert(participant.0.clone());
+            } else {
+                watched.remove(&participant.0);
+            }
+        }
+        let remote = self.room.remote_participants();
+        let Some(remote) = remote
+            .values()
+            .find(|p| p.identity().as_str() == participant.0)
+        else {
+            return;
+        };
+        for publication in remote.track_publications().values() {
+            if publication.source() == TrackSource::ScreenshareAudio {
+                publication.set_subscribed(subscribed);
+            }
+        }
+    }
+}
+
+/// Whether a participant shares their screen, and with sound. `ignoring` leaves out a publication
+/// that is being removed.
+fn screen_share_state(
+    participant: &RemoteParticipant,
+    ignoring: Option<&TrackSid>,
+) -> (bool, bool) {
+    let publications = participant.track_publications();
+    let has = |source: TrackSource| {
+        publications
+            .values()
+            .any(|p| p.source() == source && Some(&p.sid()) != ignoring)
+    };
+    let sharing = has(TrackSource::Screenshare);
+    (sharing, sharing && has(TrackSource::ScreenshareAudio))
+}
+
+fn screen_share_event(
+    participant: &RemoteParticipant,
+    ignoring: Option<&TrackSid>,
+) -> TransportEvent {
+    let (sharing, audio) = screen_share_state(participant, ignoring);
+    TransportEvent::ParticipantScreenShare {
+        id: ParticipantId(participant.identity().to_string()),
+        sharing,
+        audio,
+    }
+}
+
+async fn send_app_audio(source: NativeAudioSource, mut frames: mpsc::Receiver<Vec<i16>>) {
+    while let Some(samples) = frames.recv().await {
+        let audio = AudioFrame {
+            samples_per_channel: (samples.len() / app_audio::CHANNELS as usize) as u32,
+            data: samples.into(),
+            sample_rate: app_audio::SAMPLE_RATE,
+            num_channels: app_audio::CHANNELS,
+        };
+        if source.capture_frame(&audio).await.is_err() {
+            return;
         }
     }
 }
@@ -238,74 +495,122 @@ async fn send_microphone(source: NativeAudioSource, mut frames: mpsc::Receiver<F
 async fn forward_room_events(
     mut room_events: mpsc::UnboundedReceiver<RoomEvent>,
     events: mpsc::UnboundedSender<TransportEvent>,
+    watched: Arc<Mutex<HashSet<String>>>,
 ) {
-    // Remote-audio readers per participant. Aborted on unsubscribe: the SFU may reuse the receiver
-    // for the next participant and a stale reader would keep consuming their audio.
-    let mut readers: HashMap<String, JoinHandle<()>> = HashMap::new();
+    // Remote-audio readers per participant: voice and screen-share sound apart. Aborted on
+    // unsubscribe: the SFU may reuse the receiver for the next participant and a stale reader
+    // would keep consuming their audio.
+    let mut voices: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let mut streams: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let forward = |event: TransportEvent| events.send(event).is_ok();
     while let Some(event) = room_events.recv().await {
-        let forwarded = match event {
-            RoomEvent::ParticipantConnected(participant) => Some(joined(&participant)),
+        let open = match event {
+            RoomEvent::ParticipantConnected(participant) => forward(joined(&participant)),
             RoomEvent::ParticipantDisconnected(participant) => {
                 let id = participant.identity().to_string();
-                if let Some(reader) = readers.remove(&id) {
-                    reader.abort();
+                for readers in [&mut voices, &mut streams] {
+                    if let Some(reader) = readers.remove(&id) {
+                        reader.abort();
+                    }
                 }
-                Some(TransportEvent::ParticipantLeft {
+                forward(TransportEvent::ParticipantLeft {
                     id: ParticipantId(id),
                 })
             }
+            RoomEvent::TrackPublished {
+                publication,
+                participant,
+            } => match publication.source() {
+                TrackSource::Microphone => {
+                    publication.set_subscribed(true);
+                    true
+                }
+                TrackSource::Screenshare => forward(screen_share_event(&participant, None)),
+                TrackSource::ScreenshareAudio => {
+                    let id = participant.identity().to_string();
+                    if watched.lock().expect("watched").contains(&id) {
+                        publication.set_subscribed(true);
+                    }
+                    forward(screen_share_event(&participant, None))
+                }
+                _ => true,
+            },
+            RoomEvent::TrackUnpublished {
+                publication,
+                participant,
+            } => match publication.source() {
+                TrackSource::Screenshare | TrackSource::ScreenshareAudio => {
+                    forward(screen_share_event(&participant, Some(&publication.sid())))
+                }
+                _ => true,
+            },
             RoomEvent::TrackSubscribed {
                 track: RemoteTrack::Audio(track),
+                publication,
                 participant,
-                ..
             } => {
                 let id = participant.identity().to_string();
                 let (frames_tx, frames) = mpsc::channel(REMOTE_QUEUE_FRAMES);
-                if let Some(previous) =
-                    readers.insert(id.clone(), tokio::spawn(read_remote(track, frames_tx)))
-                {
+                let reader = tokio::spawn(read_remote(track, frames_tx));
+                let (readers, started) = match publication.source() {
+                    TrackSource::ScreenshareAudio => (
+                        &mut streams,
+                        TransportEvent::RemoteScreenAudioStarted {
+                            id: ParticipantId(id.clone()),
+                            frames,
+                        },
+                    ),
+                    _ => (
+                        &mut voices,
+                        TransportEvent::RemoteAudioStarted {
+                            id: ParticipantId(id.clone()),
+                            frames,
+                        },
+                    ),
+                };
+                if let Some(previous) = readers.insert(id, reader) {
                     previous.abort();
                 }
-                Some(TransportEvent::RemoteAudioStarted {
-                    id: ParticipantId(id),
-                    frames,
-                })
+                forward(started)
             }
             RoomEvent::TrackUnsubscribed {
                 track: RemoteTrack::Audio(_),
+                publication,
                 participant,
-                ..
             } => {
                 let id = participant.identity().to_string();
+                let screen = publication.source() == TrackSource::ScreenshareAudio;
+                let readers = if screen { &mut streams } else { &mut voices };
                 if let Some(reader) = readers.remove(&id) {
                     reader.abort();
                 }
-                Some(TransportEvent::RemoteAudioEnded {
-                    id: ParticipantId(id),
+                let id = ParticipantId(id);
+                forward(if screen {
+                    TransportEvent::RemoteScreenAudioEnded { id }
+                } else {
+                    TransportEvent::RemoteAudioEnded { id }
                 })
             }
             RoomEvent::TrackMuted {
                 participant,
                 publication,
-            } => mute_event(&participant, &publication, true),
+            } => mute_event(&participant, &publication, true).is_none_or(forward),
             RoomEvent::TrackUnmuted {
                 participant,
                 publication,
-            } => mute_event(&participant, &publication, false),
-            RoomEvent::Reconnecting => Some(TransportEvent::Reconnecting),
-            RoomEvent::Reconnected => Some(TransportEvent::Reconnected),
-            RoomEvent::Disconnected { reason } => Some(TransportEvent::Disconnected {
+            } => mute_event(&participant, &publication, false).is_none_or(forward),
+            RoomEvent::Reconnecting => forward(TransportEvent::Reconnecting),
+            RoomEvent::Reconnected => forward(TransportEvent::Reconnected),
+            RoomEvent::Disconnected { reason } => forward(TransportEvent::Disconnected {
                 reason: format!("{reason:?}"),
             }),
-            _ => None,
+            _ => true,
         };
-        if let Some(event) = forwarded
-            && events.send(event).is_err()
-        {
+        if !open {
             break;
         }
     }
-    for reader in readers.into_values() {
+    for reader in voices.into_values().chain(streams.into_values()) {
         reader.abort();
     }
 }

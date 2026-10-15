@@ -19,7 +19,8 @@ pub use audio::{
     ProcessorFactory,
 };
 pub use contract::{
-    AudioDevice, DeviceId, NetworkStats, ParticipantId, VoiceCommand, VoiceError, VoiceErrorCode,
+    AudioDevice, DeviceId, NetworkStats, ParticipantId, ScreenShare, ScreenSource, ScreenSourceId,
+    ScreenSourceKind, ShareOptimization, SharePreset, VoiceCommand, VoiceError, VoiceErrorCode,
     VoiceEvent, VoiceStats,
 };
 pub use engine::{VoiceEngine, VoiceEngineHandle};

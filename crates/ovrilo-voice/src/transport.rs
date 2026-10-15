@@ -7,7 +7,10 @@ use std::future::Future;
 use tokio::sync::mpsc;
 
 use crate::audio::Frame;
-use crate::contract::{NetworkStats, ParticipantId, VoiceError};
+use crate::contract::{
+    NetworkStats, ParticipantId, ScreenShare, ScreenSource, ScreenSourceId, ShareOptimization,
+    SharePreset, VoiceError,
+};
 
 /// Connects to rooms. One transport can create many sessions over the engine's lifetime.
 pub trait Transport: Send + Sync + 'static {
@@ -19,6 +22,11 @@ pub trait Transport: Send + Sync + 'static {
         server_url: &str,
         token: &str,
     ) -> impl Future<Output = Result<Connected<Self::Session>, VoiceError>> + Send;
+
+    /// Screens and windows that can be shared. Transports without screen sharing list none.
+    fn screen_sources(&self) -> Result<Vec<ScreenSource>, VoiceError> {
+        Ok(Vec::new())
+    }
 }
 
 /// A successful connection.
@@ -38,6 +46,37 @@ pub trait TransportSession: Send + 'static {
     /// Current network diagnostics; transports without statistics report defaults.
     fn network_stats(&self) -> impl Future<Output = NetworkStats> + Send {
         std::future::ready(NetworkStats::default())
+    }
+
+    /// Starts sharing `source` (replacing a running share). The share ends by itself with
+    /// [`TransportEvent::ScreenShareEnded`] when the source goes away or capture fails.
+    fn start_screen_share(
+        &mut self,
+        source: &ScreenSourceId,
+        preset: SharePreset,
+        optimization: ShareOptimization,
+        audio: bool,
+    ) -> impl Future<Output = Result<ScreenShare, VoiceError>> + Send {
+        let _ = (source, preset, optimization, audio);
+        std::future::ready(Err(VoiceError::capture(
+            "screen sharing is not supported by this transport",
+        )))
+    }
+
+    /// Stops the local screen share, if any.
+    fn stop_screen_share(&mut self) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+
+    /// Subscribes to (or drops) a participant's screen-share audio; frames arrive with
+    /// [`TransportEvent::RemoteScreenAudioStarted`].
+    fn set_screen_audio_subscribed(
+        &mut self,
+        participant: &ParticipantId,
+        subscribed: bool,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (participant, subscribed);
+        std::future::ready(())
     }
 }
 
@@ -63,6 +102,24 @@ pub enum TransportEvent {
     },
     RemoteAudioEnded {
         id: ParticipantId,
+    },
+    /// A remote participant started or stopped sharing their screen.
+    ParticipantScreenShare {
+        id: ParticipantId,
+        sharing: bool,
+        audio: bool,
+    },
+    /// Audio of a subscribed screen share (mono 10 ms frames, like voice).
+    RemoteScreenAudioStarted {
+        id: ParticipantId,
+        frames: mpsc::Receiver<Frame>,
+    },
+    RemoteScreenAudioEnded {
+        id: ParticipantId,
+    },
+    /// The local screen share ended without the engine asking (window closed, capture failed).
+    ScreenShareEnded {
+        reason: String,
     },
     Reconnecting,
     Reconnected,

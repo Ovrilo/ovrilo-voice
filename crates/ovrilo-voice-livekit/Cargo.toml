@@ -13,6 +13,13 @@ futures-util = "0.3"
 livekit = { version = "0.9.5", default-features = false, features = ["native", "rustls-tls-native-roots"] }
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 
+[target.'cfg(windows)'.dependencies]
+# Application sound for screen sharing: WASAPI process loopback (ADR-0017).
+wasapi = "0.26.0"
+# Which process owns a shared window (safe Win32 wrappers; the workspace denies unsafe code).
+winsafe = { version = "0.0.29", features = ["user"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+
 [dev-dependencies]
 ovrilo-voice-cpal = { path = "../ovrilo-voice-cpal" }
 livekit-api = { version = "0.9.0", default-features = false, features = ["access-token"] }
