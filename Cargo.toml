@@ -14,3 +14,38 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Noise suppression model runtime (ADR-0018): tract's debug assertions reject the DeepFilterNet3
+# graph ("duplicate name" after compaction) although release builds run it correctly, and
+# unoptimized inference is too slow for real time. Build it optimized and without them, also in
+# development and tests. Hosts embedding the engine need the same profile settings.
+[profile.dev.package.tract-core]
+debug-assertions = false
+opt-level = 3
+[profile.dev.package.tract-data]
+debug-assertions = false
+opt-level = 3
+[profile.dev.package.tract-linalg]
+debug-assertions = false
+opt-level = 3
+[profile.dev.package.tract-hir]
+debug-assertions = false
+opt-level = 3
+[profile.dev.package.tract-onnx]
+debug-assertions = false
+opt-level = 3
+[profile.dev.package.tract-onnx-opl]
+debug-assertions = false
+opt-level = 3
+[profile.dev.package.tract-nnef]
+debug-assertions = false
+opt-level = 3
+[profile.dev.package.tract-pulse]
+debug-assertions = false
+opt-level = 3
+[profile.dev.package.tract-pulse-opl]
+debug-assertions = false
+opt-level = 3
+[profile.dev.package.deep_filter]
+debug-assertions = false
+opt-level = 3

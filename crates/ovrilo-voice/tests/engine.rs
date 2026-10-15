@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use ovrilo_voice::audio::FRAME_SAMPLES;
 use ovrilo_voice::{
-    AudioBackend, AudioDevice, CaptureStream, Connected, ConnectionState, DeviceId, Frame,
-    NetworkStats, NoProcessing, ParticipantId, PlayoutStream, ScreenShare, ScreenSource,
-    ScreenSourceId, ScreenSourceKind, ShareOptimization, SharePreset, Transport, TransportEvent,
-    TransportSession, VoiceCommand, VoiceEngine, VoiceEngineHandle, VoiceError, VoiceErrorCode,
-    VoiceEvent,
+    AudioBackend, AudioDevice, AudioProcessor, CaptureStream, Connected, ConnectionState, DeviceId,
+    Frame, NetworkStats, NoProcessing, NoiseSuppression, ParticipantId, PlayoutStream,
+    ProcessorFactory, ScreenShare, ScreenSource, ScreenSourceId, ScreenSourceKind,
+    ShareOptimization, SharePreset, Transport, TransportEvent, TransportSession, VoiceCommand,
+    VoiceEngine, VoiceEngineHandle, VoiceError, VoiceErrorCode, VoiceEvent,
 };
 use tokio::sync::mpsc;
 
@@ -215,11 +215,12 @@ struct Harness {
 }
 
 fn start(devices: Devices, transport: FakeTransport) -> Harness {
-    let (handle, events) = VoiceEngine::spawn(
-        FakeBackend(devices.clone()),
-        transport.clone(),
-        Box::new(|| Box::new(NoProcessing)),
-    );
+    start_with(devices, transport, Box::new(|| Box::new(NoProcessing)))
+}
+
+fn start_with(devices: Devices, transport: FakeTransport, processor: ProcessorFactory) -> Harness {
+    let (handle, events) =
+        VoiceEngine::spawn(FakeBackend(devices.clone()), transport.clone(), processor);
     Harness {
         handle,
         events,
@@ -921,4 +922,85 @@ async fn watched_screen_audio_is_played_but_never_counts_as_speaking() {
         h.transport.room.lock().unwrap().screen_audio.is_empty()
     })
     .await;
+}
+
+/// Supports Standard and Enhanced; Enhanced falls back to Standard after a few frames, like a
+/// computer that cannot keep up.
+struct FallbackProcessor {
+    mode: NoiseSuppression,
+    enhanced_frames: u32,
+}
+
+impl AudioProcessor for FallbackProcessor {
+    fn process_render(&mut self, _frame: &mut Frame) {}
+
+    fn process_capture(&mut self, _frame: &mut Frame, _playout_delay_ms: u32) {
+        if self.mode == NoiseSuppression::Enhanced {
+            self.enhanced_frames += 1;
+            if self.enhanced_frames >= 3 {
+                self.mode = NoiseSuppression::Standard;
+            }
+        }
+    }
+
+    fn set_noise_suppression(&mut self, mode: NoiseSuppression) {
+        self.mode = mode;
+        self.enhanced_frames = 0;
+    }
+
+    fn noise_suppression(&self) -> NoiseSuppression {
+        self.mode
+    }
+}
+
+#[tokio::test]
+async fn noise_suppression_reports_the_mode_that_actually_runs() {
+    // Without a suppressor, any request is answered with Off.
+    let mut plain = start(Devices::default(), FakeTransport::default());
+    plain.send(VoiceCommand::SetNoiseSuppression(
+        NoiseSuppression::Enhanced,
+    ));
+    plain
+        .expect(&[VoiceEvent::NoiseSuppressionChanged(NoiseSuppression::Off)])
+        .await;
+
+    let mut h = start_with(
+        Devices::default(),
+        FakeTransport::default(),
+        Box::new(|| {
+            Box::new(FallbackProcessor {
+                mode: NoiseSuppression::Standard,
+                enhanced_frames: 0,
+            })
+        }),
+    );
+    // Requests are always answered, even when nothing changes.
+    h.send(VoiceCommand::SetNoiseSuppression(
+        NoiseSuppression::Standard,
+    ));
+    h.expect(&[VoiceEvent::NoiseSuppressionChanged(
+        NoiseSuppression::Standard,
+    )])
+    .await;
+    h.send(VoiceCommand::SetNoiseSuppression(
+        NoiseSuppression::Enhanced,
+    ));
+    h.expect(&[VoiceEvent::NoiseSuppressionChanged(
+        NoiseSuppression::Enhanced,
+    )])
+    .await;
+
+    // In a room the processor gives up on Enhanced by itself; the host is told.
+    h.join().await;
+    let _microphone = h.take_microphone();
+    h.speak(3000, 5);
+    loop {
+        match h.next().await {
+            VoiceEvent::NoiseSuppressionChanged(mode) => {
+                assert_eq!(mode, NoiseSuppression::Standard);
+                break;
+            }
+            _ => continue,
+        }
+    }
 }

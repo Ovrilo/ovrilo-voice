@@ -99,7 +99,7 @@ async fn main() -> Result<(), String> {
             echo_cancellation: false,
             gain_control: false,
             high_pass: false,
-            noise_suppression: false,
+            noise_suppression: ovrilo_voice::NoiseSuppression::Off,
         }
     };
     let (engine, mut events) =

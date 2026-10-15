@@ -3,7 +3,7 @@
 //! The engine works in one internal format: 48 kHz, mono, signed 16-bit, 10 ms frames.
 //! Backends convert device formats to and from it; transports convert network formats.
 
-use crate::contract::{AudioDevice, DeviceId, VoiceError};
+use crate::contract::{AudioDevice, DeviceId, NoiseSuppression, VoiceError};
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const FRAME_SAMPLES: usize = (SAMPLE_RATE / 100) as usize;
@@ -60,6 +60,13 @@ pub trait AudioProcessor {
     fn process_render(&mut self, frame: &mut Frame);
     /// Near-end microphone audio to be sent.
     fn process_capture(&mut self, frame: &mut Frame, playout_delay_ms: u32);
+    /// Requests a noise suppression mode. Processors without suppression ignore it.
+    fn set_noise_suppression(&mut self, _mode: NoiseSuppression) {}
+    /// The suppression actually running, which can differ from the request (unavailable, or
+    /// fallen back because this computer cannot keep up).
+    fn noise_suppression(&self) -> NoiseSuppression {
+        NoiseSuppression::Off
+    }
 }
 
 /// Creates the processor on the DSP thread (processors such as WebRTC's APM are not `Send`).

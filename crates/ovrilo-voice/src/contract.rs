@@ -81,6 +81,20 @@ pub enum ShareOptimization {
     Motion,
 }
 
+/// How the microphone is cleaned before it is sent (ADR-0018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum NoiseSuppression {
+    /// Microphone audio is sent as captured (echo cancellation and gain control still run).
+    Off,
+    /// WebRTC's built-in suppressor: steady noise such as fans and hum.
+    #[default]
+    Standard,
+    /// A neural suppressor plus a voice gate: also keyboard and mouse clicks and room noise, and
+    /// silence between words.
+    Enhanced,
+}
+
 /// The local user's screen share while it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenShare {
@@ -123,6 +137,10 @@ pub enum VoiceCommand {
         participant: ParticipantId,
         percent: u16,
     },
+    /// Chooses microphone noise suppression. Kept for the engine's lifetime. The mode actually
+    /// running is reported by [`VoiceEvent::NoiseSuppressionChanged`]: Enhanced can fall back to
+    /// Standard when it is unavailable or this computer cannot keep up.
+    SetNoiseSuppression(NoiseSuppression),
     /// Lists screens and windows that can be shared ([`VoiceEvent::ScreenSourcesListed`]).
     ListScreenSources,
     /// Shares a screen or window in the current room, optionally with the window's application
@@ -189,6 +207,9 @@ pub enum VoiceEvent {
         speaking: bool,
     },
     ScreenSourcesListed(Vec<ScreenSource>),
+    /// The noise suppression now running. Sent after [`VoiceCommand::SetNoiseSuppression`] and when
+    /// Enhanced falls back to Standard on its own.
+    NoiseSuppressionChanged(NoiseSuppression),
     /// The local screen share started, changed or stopped (`None`), including when the shared
     /// window closed or capture failed (an [`VoiceEvent::Error`] says why).
     ScreenShareChanged(Option<ScreenShare>),
@@ -217,6 +238,9 @@ pub struct VoiceStats {
     pub remote_frames_dropped: u64,
     /// Microphone 10 ms frames dropped because the network side was behind.
     pub microphone_frames_dropped: u64,
+    /// Time spent cleaning each 10 ms microphone frame (echo cancellation, noise suppression),
+    /// smoothed over about a second.
+    pub capture_processing_us: u32,
     pub network: NetworkStats,
 }
 
