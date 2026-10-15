@@ -502,7 +502,7 @@ async fn forward_room_events(
     // would keep consuming their audio.
     let mut voices: HashMap<String, JoinHandle<()>> = HashMap::new();
     let mut streams: HashMap<String, JoinHandle<()>> = HashMap::new();
-    let mut forward = |event: TransportEvent| events.send(event).is_ok();
+    let forward = |event: TransportEvent| events.send(event).is_ok();
     while let Some(event) = room_events.recv().await {
         let open = match event {
             RoomEvent::ParticipantConnected(participant) => forward(joined(&participant)),
@@ -594,11 +594,11 @@ async fn forward_room_events(
             RoomEvent::TrackMuted {
                 participant,
                 publication,
-            } => mute_event(&participant, &publication, true).is_none_or(&mut forward),
+            } => mute_event(&participant, &publication, true).is_none_or(forward),
             RoomEvent::TrackUnmuted {
                 participant,
                 publication,
-            } => mute_event(&participant, &publication, false).is_none_or(&mut forward),
+            } => mute_event(&participant, &publication, false).is_none_or(forward),
             RoomEvent::Reconnecting => forward(TransportEvent::Reconnecting),
             RoomEvent::Reconnected => forward(TransportEvent::Reconnected),
             RoomEvent::Disconnected { reason } => forward(TransportEvent::Disconnected {
