@@ -11,14 +11,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
 use crate::audio::{
     CaptureStream, FRAME_SAMPLES, Frame, PlayoutStream, ProcessorFactory, SAMPLE_RATE,
 };
-use crate::contract::{ParticipantId, VoiceEvent, VoiceStats};
+use crate::contract::{NoiseSuppression, ParticipantId, VoiceEvent, VoiceStats};
 use crate::mixer::Mixer;
 use crate::speaking::SpeakingDetector;
 
@@ -48,6 +48,7 @@ pub(crate) enum DspCommand {
     SetPushToTalk(bool),
     SetPushToTalkPressed(bool),
     SetParticipantVolume(ParticipantId, u16),
+    SetNoiseSuppression(NoiseSuppression),
     /// Replies once every earlier command has been applied (commands are processed in order).
     Barrier(tokio::sync::oneshot::Sender<()>),
 }
@@ -67,6 +68,7 @@ struct Counters {
     capture_overflow_samples: AtomicU64,
     remote_frames_dropped: AtomicU64,
     microphone_frames_dropped: AtomicU64,
+    capture_processing_us: AtomicU32,
 }
 
 impl Counters {
@@ -114,6 +116,7 @@ impl Dsp {
                 / u64::from(SAMPLE_RATE),
             remote_frames_dropped: c.remote_frames_dropped.load(Ordering::Relaxed),
             microphone_frames_dropped: c.microphone_frames_dropped.load(Ordering::Relaxed),
+            capture_processing_us: c.capture_processing_us.load(Ordering::Relaxed),
             network: Default::default(),
         }
     }
@@ -161,6 +164,10 @@ struct DspLoop {
     /// Speaking indicators go straight to the host (unbounded send never blocks).
     events: mpsc::UnboundedSender<VoiceEvent>,
     local_speaking: SpeakingDetector,
+    /// Last suppression mode reported to the host.
+    noise_suppression: Option<NoiseSuppression>,
+    /// Smoothed capture processing time per frame, in microseconds.
+    processing_us: f32,
 }
 
 struct Remote {
@@ -186,11 +193,12 @@ impl DspLoop {
         counters: Arc<Counters>,
         events: mpsc::UnboundedSender<VoiceEvent>,
     ) -> Self {
+        // The starting mode is known to the host; only changes are reported.
+        let noise_suppression = Some(processor.noise_suppression());
         Self {
             events,
             local_speaking: SpeakingDetector::default(),
             counters,
-            processor,
             capture: None,
             playout: None,
             microphone: None,
@@ -202,6 +210,9 @@ impl DspLoop {
             push_to_talk: false,
             ptt_pressed: false,
             ptt_tail: 0,
+            noise_suppression,
+            processing_us: 0.0,
+            processor,
         }
     }
 
@@ -274,9 +285,26 @@ impl DspLoop {
                 }
                 self.ptt_pressed = pressed;
             }
+            DspCommand::SetNoiseSuppression(mode) => {
+                self.processor.set_noise_suppression(mode);
+                // Always answer a request, even when the running mode did not change.
+                self.noise_suppression = None;
+                self.report_noise_suppression();
+            }
             DspCommand::Barrier(reply) => {
                 let _ = reply.send(());
             }
+        }
+    }
+
+    /// Tells the host when the suppression actually running changes (requested or fallen back).
+    fn report_noise_suppression(&mut self) {
+        let active = self.processor.noise_suppression();
+        if self.noise_suppression != Some(active) {
+            self.noise_suppression = Some(active);
+            let _ = self
+                .events
+                .send(VoiceEvent::NoiseSuppressionChanged(active));
         }
     }
 
@@ -390,7 +418,9 @@ impl DspLoop {
             worked = true;
             let delay =
                 self.playout.as_ref().map_or(0, |p| p.buffered_ms()) + DEVICE_LATENCY_GUESS_MS;
+            let started = Instant::now();
             self.processor.process_capture(frame, delay);
+            record_processing_time(&mut self.processing_us, &self.counters, started.elapsed());
             // The processor still sees every frame (AEC/AGC state stays converged).
             let ptt_open = !self.push_to_talk || self.ptt_pressed || self.ptt_tail > 0;
             if !self.ptt_pressed {
@@ -423,6 +453,9 @@ impl DspLoop {
                 }
             }
         }
+        if worked {
+            self.report_noise_suppression();
+        }
         worked
     }
 
@@ -442,4 +475,13 @@ impl DspLoop {
                 .store(capture.overflow_samples(), Ordering::Relaxed);
         }
     }
+}
+
+/// Smooths capture processing time over about a second of frames and publishes it.
+fn record_processing_time(average_us: &mut f32, counters: &Counters, elapsed: Duration) {
+    const SMOOTHING: f32 = 0.01;
+    *average_us += (elapsed.as_micros() as f32 - *average_us) * SMOOTHING;
+    counters
+        .capture_processing_us
+        .store(*average_us as u32, Ordering::Relaxed);
 }

@@ -8,7 +8,10 @@
 //! user watches it, and screen-share video never (the desktop's webview watches video, ADR-0017).
 
 mod app_audio;
+mod processing;
 mod screen;
+
+pub use processing::{ProcessingConfig, webrtc_processing};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -20,15 +23,13 @@ use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
-use livekit::webrtc::native::apm::AudioProcessingModule;
 use livekit::webrtc::prelude::RtcVideoSource;
 use livekit::webrtc::stats::{IceCandidatePairState, RtcStats};
 use livekit::webrtc::video_source::native::NativeVideoSource;
 use ovrilo_voice::audio::{FRAME_SAMPLES, SAMPLE_RATE};
 use ovrilo_voice::{
-    AudioProcessor, Connected, Frame, NetworkStats, ParticipantId, ProcessorFactory, ScreenShare,
-    ScreenSource, ScreenSourceId, ShareOptimization, SharePreset, Transport, TransportEvent,
-    TransportSession, VoiceError,
+    Connected, Frame, NetworkStats, ParticipantId, ScreenShare, ScreenSource, ScreenSourceId,
+    ShareOptimization, SharePreset, Transport, TransportEvent, TransportSession, VoiceError,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -632,61 +633,6 @@ async fn read_remote(track: RemoteAudioTrack, frames: mpsc::Sender<Frame>) {
                 }
             }
         }
-    }
-}
-
-/// Which WebRTC audio processing stages to run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProcessingConfig {
-    pub echo_cancellation: bool,
-    pub gain_control: bool,
-    pub high_pass: bool,
-    pub noise_suppression: bool,
-}
-
-impl Default for ProcessingConfig {
-    fn default() -> Self {
-        Self {
-            echo_cancellation: true,
-            gain_control: true,
-            high_pass: true,
-            noise_suppression: true,
-        }
-    }
-}
-
-/// Factory for the engine: creates WebRTC's Audio Processing Module on the DSP thread.
-pub fn webrtc_processing(config: ProcessingConfig) -> ProcessorFactory {
-    Box::new(move || {
-        Box::new(WebRtcProcessor {
-            apm: AudioProcessingModule::new(
-                config.echo_cancellation,
-                config.gain_control,
-                config.high_pass,
-                config.noise_suppression,
-            ),
-            echo_cancellation: config.echo_cancellation,
-        })
-    })
-}
-
-struct WebRtcProcessor {
-    apm: AudioProcessingModule,
-    echo_cancellation: bool,
-}
-
-impl AudioProcessor for WebRtcProcessor {
-    fn process_render(&mut self, frame: &mut Frame) {
-        let _ = self
-            .apm
-            .process_reverse_stream(frame, SAMPLE_RATE as i32, 1);
-    }
-
-    fn process_capture(&mut self, frame: &mut Frame, playout_delay_ms: u32) {
-        if self.echo_cancellation {
-            let _ = self.apm.set_stream_delay_ms(playout_delay_ms as i32);
-        }
-        let _ = self.apm.process_stream(frame, SAMPLE_RATE as i32, 1);
     }
 }
 

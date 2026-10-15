@@ -185,6 +185,10 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
                     percent,
                 });
             }
+            VoiceCommand::SetNoiseSuppression(mode) => {
+                // The DSP thread reports the mode that actually runs (NoiseSuppressionChanged).
+                self.dsp.send(DspCommand::SetNoiseSuppression(mode));
+            }
             VoiceCommand::SetPushToTalkPressed(pressed) => {
                 if self.push_to_talk && pressed != self.ptt_pressed {
                     self.ptt_pressed = pressed;
