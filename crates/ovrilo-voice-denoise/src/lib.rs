@@ -15,9 +15,6 @@ use ovrilo_voice::audio::{FRAME_SAMPLES, Frame};
 pub use gate::VoiceGate;
 pub use overload::OverloadDetector;
 
-/// Post-filter strength: removes more residual noise between harmonics at a small cost in voice
-/// naturalness. DeepFilterNet's own default when the post filter is enabled.
-const POST_FILTER_BETA: f32 = 0.02;
 /// Noise attenuation limit in dB. 100 means unlimited: noise is removed, not just lowered.
 const ATTENUATION_LIMIT_DB: f32 = 100.0;
 
@@ -33,9 +30,9 @@ impl Denoiser {
     /// Builds the model (embedded in the binary). Slow compared with a frame: do it when switching
     /// modes, not per frame.
     pub fn new() -> Result<Self, String> {
-        let params = RuntimeParams::default_with_ch(1)
-            .with_post_filter(POST_FILTER_BETA)
-            .with_atten_lim(ATTENUATION_LIMIT_DB);
+        // No post filter: it removes a little more residual noise but makes distant or quiet
+        // voices sound muffled; the gate already silences everything between words.
+        let params = RuntimeParams::default_with_ch(1).with_atten_lim(ATTENUATION_LIMIT_DB);
         let model = DfTract::new(DfParams::default(), &params).map_err(|e| format!("{e:#}"))?;
         if model.hop_size != FRAME_SAMPLES || model.sr != ovrilo_voice::audio::SAMPLE_RATE as usize
         {

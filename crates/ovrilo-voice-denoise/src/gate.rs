@@ -8,8 +8,9 @@ use ovrilo_voice::audio::{FRAME_SAMPLES, Frame};
 
 /// Local SNR at or above which a frame counts as speech and opens the gate.
 const OPEN_DB: f32 = 2.0;
-/// While open, frames above this keep it open (hysteresis: speech tails sit lower than onsets).
-const STAY_OPEN_DB: f32 = -4.0;
+/// While open, frames above this keep it open (hysteresis: speech tails sit lower than onsets,
+/// and a distant voice sits lower still).
+const STAY_OPEN_DB: f32 = -7.0;
 /// Frames the gate stays open after the last speech frame, so pauses between words and soft word
 /// endings are kept.
 const HOLD_FRAMES: u32 = 25;

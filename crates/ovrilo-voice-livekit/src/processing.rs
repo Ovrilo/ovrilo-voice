@@ -2,8 +2,12 @@
 //! cancellation, gain control and Standard noise suppression, and DeepFilterNet3 with a voice gate
 //! for Enhanced suppression (ADR-0018).
 //!
-//! Capture order: echo cancellation → (WebRTC suppression | none) → gain control → (Enhanced
-//! suppression and gate). Only one suppressor runs at a time.
+//! Capture order:
+//! - Standard / Off: echo cancellation → (WebRTC suppression) → gain control.
+//! - Enhanced: echo cancellation → DeepFilterNet3 → gate → gain control. Gain control runs after
+//!   the noise is gone, so a quiet or distant voice is raised instead of the room around it.
+//!
+//! Only one suppressor runs at a time.
 
 use std::time::Instant;
 
@@ -38,8 +42,9 @@ pub fn webrtc_processing(config: ProcessingConfig) -> ProcessorFactory {
     Box::new(move || {
         let mut processor = WebRtcProcessor {
             config,
-            apm_suppression: true,
-            apm: new_apm(&config, true),
+            layout: NoiseSuppression::Standard,
+            apm: build_apm(&config, NoiseSuppression::Standard),
+            gain: None,
             requested: NoiseSuppression::Standard,
             enhanced: Enhanced::Unloaded,
         };
@@ -48,12 +53,15 @@ pub fn webrtc_processing(config: ProcessingConfig) -> ProcessorFactory {
     })
 }
 
-fn new_apm(config: &ProcessingConfig, noise_suppression: bool) -> AudioProcessingModule {
+/// The APM for a layout: in Enhanced it does echo cancellation (and high-pass) only, because noise
+/// removal and gain control follow DeepFilterNet3.
+fn build_apm(config: &ProcessingConfig, layout: NoiseSuppression) -> AudioProcessingModule {
+    let enhanced = layout == NoiseSuppression::Enhanced;
     AudioProcessingModule::new(
         config.echo_cancellation,
-        config.gain_control,
+        config.gain_control && !enhanced,
         config.high_pass,
-        noise_suppression,
+        layout == NoiseSuppression::Standard,
     )
 }
 
@@ -67,25 +75,30 @@ enum Enhanced {
 
 struct WebRtcProcessor {
     config: ProcessingConfig,
+    /// What the processing chain is currently built for.
+    layout: NoiseSuppression,
     apm: AudioProcessingModule,
-    /// Whether `apm` runs WebRTC's own noise suppression.
-    apm_suppression: bool,
+    /// Gain control after DeepFilterNet3 (Enhanced layout only).
+    gain: Option<AudioProcessingModule>,
     requested: NoiseSuppression,
     enhanced: Enhanced,
 }
 
 impl WebRtcProcessor {
-    fn enhanced_active(&self) -> bool {
-        self.requested == NoiseSuppression::Enhanced && matches!(self.enhanced, Enhanced::Ready(..))
+    fn enhanced_ready(&self) -> bool {
+        matches!(self.enhanced, Enhanced::Ready(..))
     }
 
-    /// Rebuilds the APM when WebRTC suppression must be switched (echo cancellation re-converges
-    /// within a second; this only happens when the mode changes).
-    fn use_apm_suppression(&mut self, on: bool) {
-        if on != self.apm_suppression {
-            self.apm = new_apm(&self.config, on);
-            self.apm_suppression = on;
+    /// Rebuilds the chain for a layout. Echo cancellation re-converges within a second; this only
+    /// happens when the mode changes.
+    fn build(&mut self, layout: NoiseSuppression) {
+        if layout == self.layout {
+            return;
         }
+        self.apm = build_apm(&self.config, layout);
+        self.gain = (layout == NoiseSuppression::Enhanced && self.config.gain_control)
+            .then(|| AudioProcessingModule::new(false, true, false, false));
+        self.layout = layout;
     }
 }
 
@@ -102,7 +115,7 @@ impl AudioProcessor for WebRtcProcessor {
         }
         let _ = self.apm.process_stream(frame, SAMPLE_RATE as i32, 1);
 
-        if !self.enhanced_active() {
+        if self.layout != NoiseSuppression::Enhanced {
             return;
         }
         let Enhanced::Ready(denoiser, load) = &mut self.enhanced else {
@@ -110,11 +123,15 @@ impl AudioProcessor for WebRtcProcessor {
         };
         let started = Instant::now();
         denoiser.process(frame);
-        if load.record(started.elapsed()) {
+        let overloaded = load.record(started.elapsed());
+        if let Some(gain) = &mut self.gain {
+            let _ = gain.process_stream(frame, SAMPLE_RATE as i32, 1);
+        }
+        if overloaded {
             // This computer cannot run it in real time: fall back to WebRTC suppression for the
             // rest of the session (the host is told through NoiseSuppressionChanged).
             self.enhanced = Enhanced::Unavailable;
-            self.use_apm_suppression(true);
+            self.build(NoiseSuppression::Standard);
         }
     }
 
@@ -135,20 +152,16 @@ impl AudioProcessor for WebRtcProcessor {
                 };
             }
         }
-        let enhanced = self.enhanced_active();
-        self.use_apm_suppression(
-            mode == NoiseSuppression::Standard || (mode == NoiseSuppression::Enhanced && !enhanced),
-        );
+        let layout = match mode {
+            NoiseSuppression::Enhanced if self.enhanced_ready() => NoiseSuppression::Enhanced,
+            NoiseSuppression::Off => NoiseSuppression::Off,
+            _ => NoiseSuppression::Standard,
+        };
+        self.build(layout);
     }
 
     fn noise_suppression(&self) -> NoiseSuppression {
-        if self.enhanced_active() {
-            NoiseSuppression::Enhanced
-        } else if self.apm_suppression {
-            NoiseSuppression::Standard
-        } else {
-            NoiseSuppression::Off
-        }
+        self.layout
     }
 }
 
