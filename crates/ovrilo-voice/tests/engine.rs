@@ -1004,3 +1004,21 @@ async fn noise_suppression_reports_the_mode_that_actually_runs() {
         }
     }
 }
+
+#[tokio::test]
+async fn microphone_volume_scales_what_is_sent() {
+    let mut h = start(Devices::default(), FakeTransport::default());
+    h.send(VoiceCommand::SetInputVolume(50));
+    h.expect(&[VoiceEvent::InputVolumeChanged(50)]).await;
+    h.send(VoiceCommand::SetOutputVolume(500));
+    h.expect(&[VoiceEvent::OutputVolumeChanged(200)]).await;
+
+    h.join().await;
+    let mut microphone = h.take_microphone();
+    h.speak(3000, 1);
+    let frame = tokio::time::timeout(Duration::from_secs(2), microphone.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(frame.iter().all(|&s| s == 1500), "half volume");
+}

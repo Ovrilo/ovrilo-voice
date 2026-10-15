@@ -49,6 +49,8 @@ pub(crate) enum DspCommand {
     SetPushToTalkPressed(bool),
     SetParticipantVolume(ParticipantId, u16),
     SetNoiseSuppression(NoiseSuppression),
+    SetInputVolume(u16),
+    SetOutputVolume(u16),
     /// Replies once every earlier command has been applied (commands are processed in order).
     Barrier(tokio::sync::oneshot::Sender<()>),
 }
@@ -168,6 +170,9 @@ struct DspLoop {
     noise_suppression: Option<NoiseSuppression>,
     /// Smoothed capture processing time per frame, in microseconds.
     processing_us: f32,
+    /// Master volumes, percent (100 = unchanged).
+    input_volume: u16,
+    output_volume: u16,
 }
 
 struct Remote {
@@ -212,6 +217,8 @@ impl DspLoop {
             ptt_tail: 0,
             noise_suppression,
             processing_us: 0.0,
+            input_volume: 100,
+            output_volume: 100,
             processor,
         }
     }
@@ -285,6 +292,8 @@ impl DspLoop {
                 }
                 self.ptt_pressed = pressed;
             }
+            DspCommand::SetInputVolume(percent) => self.input_volume = percent,
+            DspCommand::SetOutputVolume(percent) => self.output_volume = percent,
             DspCommand::SetNoiseSuppression(mode) => {
                 self.processor.set_noise_suppression(mode);
                 // Always answer a request, even when the running mode did not change.
@@ -402,6 +411,8 @@ impl DspLoop {
         if self.deafened {
             frame.fill(0);
         } else {
+            // Before the AEC reference, so the reference matches what the speaker plays.
+            scale(frame, self.output_volume);
             self.processor.process_render(frame);
         }
         playout.write_frame(frame);
@@ -421,6 +432,8 @@ impl DspLoop {
             let started = Instant::now();
             self.processor.process_capture(frame, delay);
             record_processing_time(&mut self.processing_us, &self.counters, started.elapsed());
+            // After gain control, which would otherwise undo it.
+            scale(frame, self.input_volume);
             // The processor still sees every frame (AEC/AGC state stays converged).
             let ptt_open = !self.push_to_talk || self.ptt_pressed || self.ptt_tail > 0;
             if !self.ptt_pressed {
@@ -484,4 +497,39 @@ fn record_processing_time(average_us: &mut f32, counters: &Counters, elapsed: Du
     counters
         .capture_processing_us
         .store(*average_us as u32, Ordering::Relaxed);
+}
+
+/// Applies a volume in percent (100 = unchanged), saturating instead of wrapping.
+fn scale(frame: &mut Frame, percent: u16) {
+    if percent == 100 {
+        return;
+    }
+    let gain = i32::from(percent);
+    for sample in frame.iter_mut() {
+        *sample = (i32::from(*sample) * gain / 100).clamp(i32::from(i16::MIN), i32::from(i16::MAX))
+            as i16;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_scales_and_saturates() {
+        let mut frame: Frame = [0; FRAME_SAMPLES];
+        frame[0] = 1000;
+        frame[1] = -20_000;
+        frame[2] = 30_000;
+        let original = frame;
+        scale(&mut frame, 100);
+        assert_eq!(frame, original);
+        scale(&mut frame, 50);
+        assert_eq!(&frame[..3], &[500, -10_000, 15_000]);
+        scale(&mut frame, 200);
+        scale(&mut frame, 200);
+        assert_eq!(&frame[..3], &[2000, i16::MIN, i16::MAX]);
+        scale(&mut frame, 0);
+        assert!(frame.iter().all(|&s| s == 0));
+    }
 }

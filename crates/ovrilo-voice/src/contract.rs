@@ -137,6 +137,13 @@ pub enum VoiceCommand {
         participant: ParticipantId,
         percent: u16,
     },
+    /// Volume of the local microphone as sent, 0–200 % (100 = unchanged; values above 200 are
+    /// clamped). Applied after echo cancellation, noise suppression and gain control, so gain
+    /// control does not undo it. Kept for the engine's lifetime.
+    SetInputVolume(u16),
+    /// Volume of everything played (all participants and streams), 0–200 % (clamped). Kept for
+    /// the engine's lifetime.
+    SetOutputVolume(u16),
     /// Chooses microphone noise suppression. Kept for the engine's lifetime. The mode actually
     /// running is reported by [`VoiceEvent::NoiseSuppressionChanged`]: Enhanced can fall back to
     /// Standard when it is unavailable or this computer cannot keep up.
@@ -207,6 +214,8 @@ pub enum VoiceEvent {
         speaking: bool,
     },
     ScreenSourcesListed(Vec<ScreenSource>),
+    InputVolumeChanged(u16),
+    OutputVolumeChanged(u16),
     /// The noise suppression now running. Sent after [`VoiceCommand::SetNoiseSuppression`] and when
     /// Enhanced falls back to Standard on its own.
     NoiseSuppressionChanged(NoiseSuppression),

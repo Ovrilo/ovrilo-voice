@@ -70,6 +70,9 @@ impl VoiceEngine {
     }
 }
 
+/// Upper bound for volumes in percent (participants, microphone, speaker).
+const MAX_VOLUME_PERCENT: u16 = 200;
+
 struct Control<B: AudioBackend, T: Transport> {
     backend: B,
     transport: T,
@@ -175,7 +178,7 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
                 participant,
                 percent,
             } => {
-                let percent = percent.min(200);
+                let percent = percent.min(MAX_VOLUME_PERCENT);
                 self.dsp.send(DspCommand::SetParticipantVolume(
                     participant.clone(),
                     percent,
@@ -184,6 +187,16 @@ impl<B: AudioBackend, T: Transport> Control<B, T> {
                     participant,
                     percent,
                 });
+            }
+            VoiceCommand::SetInputVolume(percent) => {
+                let percent = percent.min(MAX_VOLUME_PERCENT);
+                self.dsp.send(DspCommand::SetInputVolume(percent));
+                self.emit(VoiceEvent::InputVolumeChanged(percent));
+            }
+            VoiceCommand::SetOutputVolume(percent) => {
+                let percent = percent.min(MAX_VOLUME_PERCENT);
+                self.dsp.send(DspCommand::SetOutputVolume(percent));
+                self.emit(VoiceEvent::OutputVolumeChanged(percent));
             }
             VoiceCommand::SetNoiseSuppression(mode) => {
                 // The DSP thread reports the mode that actually runs (NoiseSuppressionChanged).
