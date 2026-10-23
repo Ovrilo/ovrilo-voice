@@ -35,3 +35,7 @@ cargo run -p ovrilo-voice-livekit --example voice_room --release -- --identity a
 - Hosts interact via `VoiceCommand` / `VoiceEvent`; events must be throttled, never raw PCM.
 - Keep platform-specific code out of the core; isolate behind adapters.
 - Report CPU, memory, underruns, latency and jitter with test conditions for voice changes (ADR-0009).
+
+## License
+
+Copyright 2026 Barış Taner. Licensed under the Apache License, Version 2.0 (see [LICENSE](LICENSE) and [NOTICE](NOTICE)).
